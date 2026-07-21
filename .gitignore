@@ -1,0 +1,6 @@
+*.log
+log/
+Waterwall
+libs/
+*.zip
+.DS_Store
