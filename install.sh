@@ -69,8 +69,15 @@ detect_arch_asset() {
 ensure_deps() {
   msg "Installing dependencies..."
   export DEBIAN_FRONTEND=noninteractive
-  apt-get update -y >/dev/null
-  apt-get install -y curl unzip ca-certificates jq iproute2 >/dev/null
+  if ! apt-get update -y >/dev/null; then
+    err "apt-get update failed"
+  fi
+  if ! apt-get install -y curl unzip ca-certificates jq iproute2 openssl >/dev/null; then
+    err "apt-get install failed (need curl unzip jq iproute2 openssl)"
+  fi
+  command -v curl >/dev/null || err "curl missing after apt install"
+  command -v unzip >/dev/null || err "unzip missing after apt install"
+  ok "Dependencies ready"
 }
 
 download_waterwall() {
@@ -80,11 +87,17 @@ download_waterwall() {
   zip_path="/tmp/${asset}"
 
   msg "Downloading WaterWall ${WW_RELEASE} (${asset})..."
-  curl -fsSL "${WW_REPO}/${asset}" -o "$zip_path"
+  if ! curl -fL --connect-timeout 30 --max-time 300 "${WW_REPO}/${asset}" -o "$zip_path"; then
+    err "Download failed: ${WW_REPO}/${asset}"
+  fi
+  [[ -s "$zip_path" ]] || err "Downloaded zip is empty: $zip_path"
 
+  msg "Extracting WaterWall binary..."
   mkdir -p "$INSTALL_DIR"
   rm -rf "${INSTALL_DIR}/Waterwall" "${INSTALL_DIR}/libs" 2>/dev/null || true
-  unzip -o "$zip_path" -d "$INSTALL_DIR" >/dev/null
+  if ! unzip -o "$zip_path" -d "$INSTALL_DIR" >/dev/null; then
+    err "unzip failed (is unzip installed?)"
+  fi
   rm -f "$zip_path"
 
   # binary may be nested
@@ -99,8 +112,22 @@ download_waterwall() {
 }
 
 gen_key() {
-  # AesGcm expects exactly 32 bytes
-  tr -dc 'A-Za-z0-9' </dev/urandom | head -c 32
+  # AesGcm expects exactly 32 alphanumeric chars.
+  # IMPORTANT: with set -o pipefail, tr|head -c often exits 141 (SIGPIPE) when
+  # head closes the pipe early. That aborts key="$(gen_key)" under set -e with
+  # NO error message — looks like a hang right after the AES key prompt.
+  local key=""
+  local n=0
+  if command -v openssl >/dev/null 2>&1; then
+    key="$(openssl rand -hex 16 2>/dev/null || true)"
+  fi
+  while [[ ${#key} -lt 32 && $n -lt 8 ]]; do
+    key+="$( { tr -dc 'A-Za-z0-9' </dev/urandom || true; } | head -c $((32 - ${#key})) || true )"
+    n=$((n + 1))
+  done
+  key="${key:0:32}"
+  [[ ${#key} -eq 32 ]] || { echo "ERR failed to generate 32-char AES key" >&2; return 1; }
+  printf '%s' "$key"
 }
 
 validate_ip() {
@@ -466,10 +493,12 @@ EOF
 }
 
 start_service() {
-  systemctl daemon-reload
-  systemctl enable --now "${SERVICE_NAME}.service"
+  msg "Enabling and starting ${SERVICE_NAME}.service..."
+  systemctl daemon-reload || err "systemctl daemon-reload failed"
+  systemctl enable --now "${SERVICE_NAME}.service" || err "Failed to enable/start ${SERVICE_NAME}.service"
   sleep 1
   systemctl --no-pager --full status "${SERVICE_NAME}.service" || true
+  ok "Service started (or start attempted - check status above)"
 }
 
 stop_service() {
@@ -558,8 +587,12 @@ prompt_install() {
   if [[ "$encrypt" == "1" ]]; then
     read_tty -r -p "AES key (32 chars, empty=auto): " key || true
     if [[ -z "${key:-}" ]]; then
-      key="$(gen_key)"
-      echo -e "${YLW}Generated key (save it for the other side):${NC} $key"
+      msg "Generating AES key..."
+      key="$(gen_key)" || err "AES key auto-generation failed"
+      echo
+      echo -e "${YLW}Generated AES key (save + use SAME key on the other side):${NC}"
+      echo -e "  ${GRN}${key}${NC}"
+      echo
     fi
     [[ ${#key} -eq 32 ]] || err "AES key must be exactly 32 characters (got ${#key})"
   fi
@@ -573,8 +606,11 @@ prompt_install() {
 
   if [[ "$side" == "ir" ]]; then mtu=1320; else mtu=1380; fi
 
+  msg "Starting install for side=${side}..."
   ensure_deps
   download_waterwall "$oldcpu"
+
+  msg "Writing core.json and tunnel config..."
   write_core_json "$side" "$mtu"
 
   if [[ "$side" == "ir" ]]; then
@@ -582,26 +618,36 @@ prompt_install() {
   else
     write_kharej_config "$iran_ip" "$kh_ip" "$proto" "$encrypt" "$key"
   fi
+  ok "Config files written under $INSTALL_DIR"
 
   # keep installer locally for ww51 menu
-  if [[ -f "${BASH_SOURCE[0]:-}" ]]; then
+  msg "Saving installer copy..."
+  if [[ -f "${BASH_SOURCE[0]:-}" && -r "${BASH_SOURCE[0]}" ]]; then
     cp -f "${BASH_SOURCE[0]}" "${INSTALL_DIR}/install.sh" 2>/dev/null || true
-  else
-    curl -fsSL "${REPO_RAW}/install.sh" -o "${INSTALL_DIR}/install.sh" || true
+  fi
+  if [[ ! -f "${INSTALL_DIR}/install.sh" ]]; then
+    curl -fsSL "${REPO_RAW}/install.sh" -o "${INSTALL_DIR}/install.sh" || warn "Could not cache install.sh locally"
   fi
   chmod +x "${INSTALL_DIR}/install.sh" 2>/dev/null || true
 
+  msg "Writing config (tunnel.env)..."
   write_env "$side" "$iran_ip" "$kh_ip" "$proto" "$encrypt" "$key" "$ports" "$oldcpu"
+  [[ -f "$CONF_ENV" ]] || err "Failed to write $CONF_ENV"
+
+  msg "Installing systemd unit..."
   write_service
+  [[ -f "/etc/systemd/system/${SERVICE_NAME}.service" ]] || err "Failed to write systemd unit"
   write_menu_wrapper
   sysctl_tune
 
   # disable ufw if present (common for raw/tun tunnels)
   if command -v ufw >/dev/null 2>&1; then
+    msg "Disabling ufw (raw/tun tunnels)..."
     ufw disable >/dev/null 2>&1 || true
   fi
 
   start_service
+
 
   echo
   ok "Installed on side=${side}"
