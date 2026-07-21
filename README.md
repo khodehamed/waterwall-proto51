@@ -7,7 +7,7 @@
 روی **هر دو سرور** (اول خارج، بعد ایران):
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/khodehamed/waterwall-proto51/main/install.sh | sudo bash
+curl -fsSL https://raw.githubusercontent.com/khodehamed/waterwall-proto51/master/install.sh | sudo bash
 ```
 
 بعد از نصب، منو با دستور `ww51` هم در دسترس است.
@@ -54,7 +54,7 @@ ip addr show wtun0
 ## حذف
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/khodehamed/waterwall-proto51/main/install.sh | sudo bash
+curl -fsSL https://raw.githubusercontent.com/khodehamed/waterwall-proto51/master/install.sh | sudo bash
 # گزینه 5) Uninstall
 ```
 

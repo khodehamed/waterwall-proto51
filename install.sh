@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
 # WaterWall Proto51 port-forward tunnel installer
 #
-#   curl -fsSL https://raw.githubusercontent.com/khodehamed/waterwall-proto51/main/install.sh | sudo bash
+#   curl -fsSL https://raw.githubusercontent.com/khodehamed/waterwall-proto51/master/install.sh | sudo bash
 #
 set -euo pipefail
 
-REPO_RAW="${WATERWALL_PROTO51_RAW:-https://raw.githubusercontent.com/khodehamed/waterwall-proto51/main}"
+REPO_RAW="${WATERWALL_PROTO51_RAW:-https://raw.githubusercontent.com/khodehamed/waterwall-proto51/master}"
 WW_RELEASE="${WATERWALL_RELEASE:-v1.46.3}"
 WW_REPO="https://github.com/radkesvat/WaterWall/releases/download/${WW_RELEASE}"
 INSTALL_DIR="/opt/waterwall-proto51"
@@ -436,7 +436,7 @@ EOF
 write_menu_wrapper() {
   cat > "$BIN_LINK" <<'EOF'
 #!/usr/bin/env bash
-exec bash -c 'curl -fsSL https://raw.githubusercontent.com/khodehamed/waterwall-proto51/main/install.sh | sudo bash'
+exec bash -c 'curl -fsSL https://raw.githubusercontent.com/khodehamed/waterwall-proto51/master/install.sh | sudo bash'
 EOF
   # Prefer local copy if present
   cat > "$BIN_LINK" <<EOF
