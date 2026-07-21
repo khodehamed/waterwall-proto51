@@ -434,11 +434,6 @@ EOF
 }
 
 write_menu_wrapper() {
-  cat > "$BIN_LINK" <<'EOF'
-#!/usr/bin/env bash
-exec bash -c 'curl -fsSL https://raw.githubusercontent.com/khodehamed/waterwall-proto51/master/install.sh | sudo bash'
-EOF
-  # Prefer local copy if present
   cat > "$BIN_LINK" <<EOF
 #!/usr/bin/env bash
 if [[ -f "${INSTALL_DIR}/install.sh" ]]; then
