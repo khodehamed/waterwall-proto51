@@ -10,6 +10,19 @@
 curl -fsSL https://raw.githubusercontent.com/khodehamed/waterwall-proto51/master/install.sh | sudo bash
 ```
 
+If the menu appears but keyboard input does not work (classic `curl | bash` stdin issue), use one of these instead:
+
+```bash
+sudo bash <(curl -fsSL https://raw.githubusercontent.com/khodehamed/waterwall-proto51/master/install.sh)
+```
+
+or:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/khodehamed/waterwall-proto51/master/install.sh -o install.sh
+sudo bash install.sh
+```
+
 بعد از نصب، منو با دستور `ww51` هم در دسترس است.
 
 ## کارهایی که اسکریپت می‌کند

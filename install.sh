@@ -31,6 +31,17 @@ ok()   { echo -e "${GRN}OK${NC} $*"; }
 warn() { echo -e "${YLW}WARN${NC} $*"; }
 err()  { echo -e "${RED}ERR${NC} $*" >&2; exit 1; }
 
+# Interactive prompts must use the controlling TTY so `curl | bash` works
+# (stdin is the pipe, not the keyboard).
+read_tty() {
+  if [[ -r /dev/tty ]]; then
+    read "$@" </dev/tty
+  else
+    # fallback for rare non-TTY environments
+    read "$@"
+  fi
+}
+
 detect_arch_asset() {
   local arch oldcpu="$1"
   arch="$(uname -m)"
@@ -505,26 +516,26 @@ prompt_install() {
   echo -e "${CYN}Select side:${NC}"
   echo "  1) Iran   (listen 0.0.0.0 and forward selected ports to kharej)"
   echo "  2) Kharej (packet tunnel endpoint; panel should listen on ports)"
-  read -r -p "Choice [1/2]: " side
+  read_tty -r -p "Choice [1/2]: " side
   case "$side" in
     1) side="ir" ;;
     2) side="kharej" ;;
     *) err "Invalid choice" ;;
   esac
 
-  read -r -p "Iran public IP: " iran_ip
+  read_tty -r -p "Iran public IP: " iran_ip
   validate_ip "$iran_ip" || err "Invalid Iran IP"
-  read -r -p "Kharej public IP: " kh_ip
+  read_tty -r -p "Kharej public IP: " kh_ip
   validate_ip "$kh_ip" || err "Invalid Kharej IP"
 
   proto=51
-  read -r -p "IP protocol number [${proto}]: " tmp || true
+  read_tty -r -p "IP protocol number [${proto}]: " tmp || true
   [[ -n "${tmp:-}" ]] && proto="$tmp"
   [[ "$proto" =~ ^[0-9]+$ ]] && ((proto >= 0 && proto <= 255)) || err "Invalid protocol"
 
   if [[ "$side" == "ir" ]]; then
     echo "Ports to forward from Iran 0.0.0.0 (space/comma separated)"
-    read -r -p "Ports [${default_ports}]: " ports
+    read_tty -r -p "Ports [${default_ports}]: " ports
     ports="$(normalize_ports "${ports:-$default_ports}")"
     validate_ports "$ports" || err "Invalid ports"
   else
@@ -537,7 +548,7 @@ prompt_install() {
   fi
 
   encrypt=1
-  read -r -p "Enable AesGcm encryption? [Y/n]: " tmp || true
+  read_tty -r -p "Enable AesGcm encryption? [Y/n]: " tmp || true
   case "${tmp:-Y}" in
     n|N|no|NO) encrypt=0 ;;
     *) encrypt=1 ;;
@@ -545,7 +556,7 @@ prompt_install() {
 
   key=""
   if [[ "$encrypt" == "1" ]]; then
-    read -r -p "AES key (32 chars, empty=auto): " key || true
+    read_tty -r -p "AES key (32 chars, empty=auto): " key || true
     if [[ -z "${key:-}" ]]; then
       key="$(gen_key)"
       echo -e "${YLW}Generated key (save it for the other side):${NC} $key"
@@ -554,7 +565,7 @@ prompt_install() {
   fi
 
   oldcpu=0
-  read -r -p "Use old-cpu WaterWall binary? [y/N]: " tmp || true
+  read_tty -r -p "Use old-cpu WaterWall binary? [y/N]: " tmp || true
   case "${tmp:-N}" in
     y|Y|yes|YES) oldcpu=1 ;;
     *) oldcpu=0 ;;
@@ -616,7 +627,7 @@ change_ports() {
   [[ "${SIDE}" == "ir" ]] || err "Port forward is configured on Iran side only"
 
   local ports
-  read -r -p "New ports (space/comma) [${PORTS}]: " ports
+  read_tty -r -p "New ports (space/comma) [${PORTS}]: " ports
   ports="$(normalize_ports "${ports:-$PORTS}")"
   validate_ports "$ports" || err "Invalid ports"
 
@@ -627,26 +638,30 @@ change_ports() {
 }
 
 menu() {
-  clear 2>/dev/null || true
-  echo -e "${CYN}WaterWall Proto51 Tunnel${NC}"
-  echo "========================="
-  echo "1) Install / Reinstall"
-  echo "2) Status"
-  echo "3) Restart"
-  echo "4) Change Iran ports"
-  echo "5) Uninstall"
-  echo "0) Exit"
-  echo
-  read -r -p "Select: " c
-  case "$c" in
-    1) prompt_install ;;
-    2) show_status ;;
-    3) systemctl restart "$SERVICE_NAME"; show_status ;;
-    4) change_ports ;;
-    5) uninstall_all ;;
-    0) exit 0 ;;
-    *) err "Invalid option" ;;
-  esac
+  while true; do
+    clear 2>/dev/null || true
+    echo -e "${CYN}WaterWall Proto51 Tunnel${NC}"
+    echo "========================="
+    echo "1) Install / Reinstall"
+    echo "2) Status"
+    echo "3) Restart"
+    echo "4) Change Iran ports"
+    echo "5) Uninstall"
+    echo "0) Exit"
+    echo
+    read_tty -r -p "Select: " c || exit 0
+    case "$c" in
+      1) prompt_install ;;
+      2) show_status ;;
+      3) systemctl restart "$SERVICE_NAME"; show_status ;;
+      4) change_ports ;;
+      5) uninstall_all ;;
+      0) exit 0 ;;
+      *) warn "Invalid option" ;;
+    esac
+    echo
+    read_tty -r -p "Press Enter to continue..." _ || true
+  done
 }
 
 main() {
