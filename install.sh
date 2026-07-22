@@ -95,7 +95,8 @@ download_waterwall() {
   msg "Extracting WaterWall binary..."
   mkdir -p "$INSTALL_DIR" "${INSTALL_DIR}/log" "${INSTALL_DIR}/libs"
   rm -f "${INSTALL_DIR}/Waterwall" 2>/dev/null || true
-  # Keep any existing libs/; release zips for 1.46.x often ship a single static Waterwall binary.
+  # Official 1.46.x zips ship a single Waterwall binary (EncryptionClient/Server
+  # are statically linked). libs/ is kept for core.json libs-path compatibility only.
   if ! unzip -o "$zip_path" -d "$INSTALL_DIR" >/dev/null; then
     err "unzip failed (is unzip installed?)"
   fi
@@ -113,10 +114,10 @@ download_waterwall() {
 }
 
 gen_key() {
-  # AesGcm expects exactly 32 alphanumeric chars.
+  # Shared EncryptionClient/Server password: exactly 32 alphanumeric chars.
   # IMPORTANT: with set -o pipefail, tr|head -c often exits 141 (SIGPIPE) when
   # head closes the pipe early. That aborts key="$(gen_key)" under set -e with
-  # NO error message — looks like a hang right after the AES key prompt.
+  # NO error message — looks like a hang right after the key prompt.
   local key=""
   local n=0
   if command -v openssl >/dev/null 2>&1; then
@@ -175,19 +176,79 @@ assert_ports_free() {
   fi
 }
 
-build_port_forward_nodes() {
+# Official docs:
+#   https://radkesvat.github.io/WaterWall-Docs/docs/noderefs/EncryptionClient
+#   https://radkesvat.github.io/WaterWall-Docs/docs/noderefs/EncryptionServer
+# Pattern: TcpListener -> EncryptionClient -> TcpConnector  (Iran)
+#          TcpListener -> EncryptionServer -> TcpConnector  (Kharej)
+# AesGcm is NOT in WaterWall 1.46.x (no tunnel, no libs plugin) — do not use it.
+ENC_SALT_DEFAULT="waterwall-proto51"
+ENC_ALGO_DEFAULT="aes-gcm"
+ENC_KDF_DEFAULT="12000"
+
+ensure_encryption_support() {
+  # EncryptionClient/Server are statically linked in official WaterWall builds.
+  # Refuse early instead of writing a config that will crash at runtime.
+  # AesGcm is NOT shipped (no tunnel + no libs plugin) — we never emit it.
+  local bin="${INSTALL_DIR}/Waterwall"
+  [[ -x "$bin" ]] || err "Waterwall binary missing at $bin (download first)"
+  if ! grep -a -q 'EncryptionClient' "$bin" 2>/dev/null; then
+    err "This WaterWall binary lacks EncryptionClient. Re-download an official release (v1.46+) or keep encryption OFF."
+  fi
+  if ! grep -a -q 'EncryptionServer' "$bin" 2>/dev/null; then
+    err "This WaterWall binary lacks EncryptionServer. Re-download an official release (v1.46+) or keep encryption OFF."
+  fi
+  ok "EncryptionClient/Server present in binary (no libs/ plugin required)"
+}
+
+build_iran_forward_nodes() {
   # WaterWall 1.46+ auto-inserts TcpConnector.domain-resolver and does NOT allow
-  # multiple listeners to share one connector next. Emit one listener+connector
-  # pair per port instead of fan-in to a shared "to_kharej".
-  local ports="$1"
-  local p first=1
+  # multiple listeners to share one connector next. Emit one chain per port.
+  # encrypt=1: TcpListener -> EncryptionClient -> TcpConnector(10.10.0.2:port)
+  local ports="$1" encrypt="$2" key="$3"
+  local p first=1 next_name
   for p in $ports; do
     if [[ $first -eq 1 ]]; then
       first=0
     else
       printf ',\n'
     fi
-    cat <<EOF
+    if [[ "$encrypt" == "1" ]]; then
+      next_name="enc${p}"
+      cat <<EOF
+        {
+            "name": "p${p}",
+            "type": "TcpListener",
+            "settings": {
+                "address": "0.0.0.0",
+                "port": ${p},
+                "nodelay": true
+            },
+            "next": "${next_name}"
+        },
+        {
+            "name": "${next_name}",
+            "type": "EncryptionClient",
+            "settings": {
+                "algorithm": "${ENC_ALGO_DEFAULT}",
+                "password": "${key}",
+                "salt": "${ENC_SALT_DEFAULT}",
+                "kdf-iterations": ${ENC_KDF_DEFAULT}
+            },
+            "next": "c${p}"
+        },
+        {
+            "name": "c${p}",
+            "type": "TcpConnector",
+            "settings": {
+                "nodelay": true,
+                "address": "10.10.0.2",
+                "port": ${p}
+            }
+        }
+EOF
+    else
+      cat <<EOF
         {
             "name": "p${p}",
             "type": "TcpListener",
@@ -204,6 +265,55 @@ build_port_forward_nodes() {
             "settings": {
                 "nodelay": true,
                 "address": "10.10.0.2",
+                "port": ${p}
+            }
+        }
+EOF
+    fi
+  done
+}
+
+build_kharej_decrypt_nodes() {
+  # When encryption is ON, Kharej decrypts on the TUN IP then hands plain TCP
+  # to the panel on 127.0.0.1 (panel must NOT bind 0.0.0.0/10.10.0.1).
+  # TcpListener(10.10.0.1) -> EncryptionServer -> TcpConnector(127.0.0.1)
+  local ports="$1" key="$2"
+  local p first=1
+  [[ -n "$ports" ]] || return 0
+  for p in $ports; do
+    if [[ $first -eq 1 ]]; then
+      first=0
+    else
+      printf ',\n'
+    fi
+    cat <<EOF
+        {
+            "name": "p${p}",
+            "type": "TcpListener",
+            "settings": {
+                "address": "10.10.0.1",
+                "port": ${p},
+                "nodelay": true
+            },
+            "next": "enc${p}"
+        },
+        {
+            "name": "enc${p}",
+            "type": "EncryptionServer",
+            "settings": {
+                "algorithm": "${ENC_ALGO_DEFAULT}",
+                "password": "${key}",
+                "salt": "${ENC_SALT_DEFAULT}",
+                "kdf-iterations": ${ENC_KDF_DEFAULT}
+            },
+            "next": "c${p}"
+        },
+        {
+            "name": "c${p}",
+            "type": "TcpConnector",
+            "settings": {
+                "nodelay": true,
+                "address": "127.0.0.1",
                 "port": ${p}
             }
         }
@@ -257,28 +367,12 @@ EOF
 }
 
 write_iran_config() {
+  # Packet path stays unencrypted (TunDevice...RawSocket + protoswap).
+  # Optional AEAD sits on the TCP forward chains (EncryptionClient).
   local iran_ip="$1" kh_ip="$2" proto="$3" encrypt="$4" key="$5" ports="$6"
-  local forward_nodes aes_node next_after_tun
+  local forward_nodes
 
-  forward_nodes="$(build_port_forward_nodes "$ports")"
-
-  if [[ "$encrypt" == "1" ]]; then
-    next_after_tun="aes"
-    aes_node="$(cat <<EOF
-        {
-            "name": "aes",
-            "type": "AesGcm",
-            "settings": {
-                "key": "${key}"
-            },
-            "next": "ipovsrc"
-        },
-EOF
-)"
-  else
-    next_after_tun="ipovsrc"
-    aes_node=""
-  fi
+  forward_nodes="$(build_iran_forward_nodes "$ports" "$encrypt" "$key")"
 
   cat > "${INSTALL_DIR}/config_ir.json" <<EOF
 {
@@ -291,9 +385,8 @@ EOF
                 "device-name": "wtun0",
                 "device-ip": "10.10.0.1/24"
             },
-            "next": "${next_after_tun}"
+            "next": "ipovsrc"
         },
-${aes_node}
         {
             "name": "ipovsrc",
             "type": "IpOverrider",
@@ -357,25 +450,16 @@ EOF
 }
 
 write_kharej_config() {
-  local iran_ip="$1" kh_ip="$2" proto="$3" encrypt="$4" key="$5"
-  local aes_node next_after_tun
+  # Packet path: TunDevice...RawSocket + protoswap (same PROTO as Iran).
+  # encrypt=1: add EncryptionServer listeners on 10.10.0.1 -> 127.0.0.1 panel.
+  local iran_ip="$1" kh_ip="$2" proto="$3" encrypt="$4" key="$5" ports="$6"
+  local decrypt_nodes="" decrypt_block=""
 
   if [[ "$encrypt" == "1" ]]; then
-    next_after_tun="aes"
-    aes_node="$(cat <<EOF
-        {
-            "name": "aes",
-            "type": "AesGcm",
-            "settings": {
-                "key": "${key}"
-            },
-            "next": "ipovsrc"
-        },
-EOF
-)"
-  else
-    next_after_tun="ipovsrc"
-    aes_node=""
+    decrypt_nodes="$(build_kharej_decrypt_nodes "$ports" "$key")"
+    [[ -n "$decrypt_nodes" ]] || err "Encryption enabled but no ports configured (needed on Kharej for EncryptionServer)"
+    decrypt_block=",
+${decrypt_nodes}"
   fi
 
   cat > "${INSTALL_DIR}/config_kharej.json" <<EOF
@@ -389,9 +473,8 @@ EOF
                 "device-name": "wtun0",
                 "device-ip": "10.10.0.1/24"
             },
-            "next": "${next_after_tun}"
+            "next": "ipovsrc"
         },
-${aes_node}
         {
             "name": "ipovsrc",
             "type": "IpOverrider",
@@ -447,13 +530,15 @@ ${aes_node}
                 "capture-filter-mode": "source-ip",
                 "capture-ip": "${iran_ip}"
             }
-        }
+        }${decrypt_block}
     ]
 }
 EOF
 }
 
 write_env() {
+  # PROTO = IpManipulator protoswap (0-255). ENCRYPT=1 uses EncryptionClient/Server.
+  # AES_KEY is the shared Encryption password (32 chars). Not the removed AesGcm node.
   cat > "$CONF_ENV" <<EOF
 SIDE=$1
 IRAN_IP=$2
@@ -463,6 +548,8 @@ ENCRYPT=$5
 AES_KEY=$6
 PORTS="$7"
 OLDCPU=$8
+ENC_ALGO=${ENC_ALGO_DEFAULT}
+ENC_SALT=${ENC_SALT_DEFAULT}
 EOF
   chmod 600 "$CONF_ENV"
 }
@@ -650,8 +737,9 @@ show_status() {
     echo "  side      : ${SIDE:-?}"
     echo "  iran ip   : ${IRAN_IP:-?}"
     echo "  kharej ip : ${KHAREJ_IP:-?}"
-    echo "  proto     : ${PROTO:-?}"
-    echo "  encrypt   : ${ENCRYPT:-0}"
+    echo "  proto     : ${PROTO:-?}  (IpManipulator protoswap; editable via menu 4)"
+    echo "  encrypt   : ${ENCRYPT:-0}  (0=off, 1=EncryptionClient/Server AEAD)"
+    echo "  enc algo  : ${ENC_ALGO:-$ENC_ALGO_DEFAULT}"
     echo "  ports     : ${PORTS:-?}"
     echo "  old-cpu   : ${OLDCPU:-0}"
   else
@@ -681,7 +769,13 @@ apply_tunnel_config() {
 
   if [[ "$side" == "ir" ]]; then mtu=1320; else mtu=1380; fi
 
-  # Stop first so Iran port-free check does not see our own listeners.
+  if [[ "$encrypt" == "1" ]]; then
+    ensure_encryption_support
+    [[ -n "$ports" ]] || err "Encryption requires PORTS on both sides (same list)"
+    [[ ${#key} -eq 32 ]] || err "AES/Encryption password must be exactly 32 characters"
+  fi
+
+  # Stop first so port-free check does not see our own listeners.
   systemctl stop "${SERVICE_NAME}.service" 2>/dev/null || true
   sleep 1
 
@@ -690,7 +784,10 @@ apply_tunnel_config() {
     assert_ports_free "$ports"
     write_iran_config "$iran_ip" "$kh_ip" "$proto" "$encrypt" "$key" "$ports"
   else
-    write_kharej_config "$iran_ip" "$kh_ip" "$proto" "$encrypt" "$key"
+    if [[ "$encrypt" == "1" ]]; then
+      assert_ports_free "$ports"
+    fi
+    write_kharej_config "$iran_ip" "$kh_ip" "$proto" "$encrypt" "$key" "$ports"
   fi
   write_env "$side" "$iran_ip" "$kh_ip" "$proto" "$encrypt" "$key" "$ports" "$oldcpu"
   write_service
@@ -699,7 +796,7 @@ apply_tunnel_config() {
   systemctl restart "${SERVICE_NAME}.service" || true
   sleep 2
   if [[ "$(systemctl is-active "${SERVICE_NAME}.service" 2>/dev/null || true)" == "active" ]]; then
-    ok "Tunnel config applied; service active"
+    ok "Tunnel config applied; service active (PROTO=${proto} ENCRYPT=${encrypt})"
     return 0
   fi
   show_failure_logs
@@ -725,7 +822,9 @@ edit_tunnel() {
 
   echo
   echo -e "${CYN}Edit tunnel${NC} (Enter keeps current value)"
-  echo "  current side: ${side}"
+  echo "  current side : ${side}"
+  echo "  PROTO is saved to tunnel.env and written into IpManipulator.protoswap"
+  echo
 
   read_tty -r -p "Iran public IP [${iran_ip}]: " tmp || true
   [[ -n "${tmp:-}" ]] && iran_ip="$tmp"
@@ -735,22 +834,21 @@ edit_tunnel() {
   [[ -n "${tmp:-}" ]] && kh_ip="$tmp"
   validate_ip "$kh_ip" || err "Invalid Kharej IP"
 
-  read_tty -r -p "IP protocol number [${proto}]: " tmp || true
+  echo
+  echo -e "${CYN}IP protocol number (protoswap)${NC} — must match on Iran and Kharej"
+  read_tty -r -p "Protocol [${proto}]: " tmp || true
   [[ -n "${tmp:-}" ]] && proto="$tmp"
-  [[ "$proto" =~ ^[0-9]+$ ]] && ((proto >= 0 && proto <= 255)) || err "Invalid protocol"
-
-  if [[ "$side" == "ir" ]]; then
-    read_tty -r -p "Iran listen ports [${ports}]: " tmp || true
-    [[ -n "${tmp:-}" ]] && ports="$(normalize_ports "$tmp")"
-    ports="$(normalize_ports "$ports")"
-    validate_ports "$ports" || err "Invalid ports"
-  fi
+  [[ "$proto" =~ ^[0-9]+$ ]] && ((proto >= 0 && proto <= 255)) || err "Invalid protocol (0-255)"
 
   local enc_prompt="N"
   [[ "$encrypt" == "1" ]] && enc_prompt="Y"
   echo
-  echo -e "${YLW}Note:${NC} AesGcm stays OFF unless you explicitly enable it (official binaries often lack the plugin)."
-  read_tty -r -p "Enable AesGcm encryption? [y/N] (current: ${enc_prompt}): " tmp || true
+  echo -e "${CYN}Encryption${NC} (official WaterWall AEAD nodes — NOT the removed AesGcm plugin)"
+  echo "  Iran  : TcpListener -> EncryptionClient -> TcpConnector"
+  echo "  Kharej: TcpListener(10.10.0.1) -> EncryptionServer -> TcpConnector(127.0.0.1)"
+  echo "  Docs  : https://radkesvat.github.io/WaterWall-Docs/docs/noderefs/EncryptionClient"
+  echo "  Default OFF for safety. No libs/ plugin required (nodes are built into the binary)."
+  read_tty -r -p "Enable EncryptionClient/Server? [y/N] (current: ${enc_prompt}): " tmp || true
   case "${tmp:-}" in
     y|Y|yes|YES) encrypt=1 ;;
     n|N|no|NO) encrypt=0 ;;
@@ -758,16 +856,27 @@ edit_tunnel() {
     *) warn "Keeping current encrypt=${encrypt}" ;;
   esac
 
+  # Ports: always on Iran; also required on Kharej when encryption is on.
+  if [[ "$side" == "ir" || "$encrypt" == "1" ]]; then
+    local ports_label="Listen / forward ports"
+    [[ "$side" == "kharej" ]] && ports_label="Same ports as Iran (Kharej EncryptionServer)"
+    read_tty -r -p "${ports_label} [${ports:-80 443}]: " tmp || true
+    [[ -n "${tmp:-}" ]] && ports="$(normalize_ports "$tmp")"
+    ports="$(normalize_ports "${ports:-}")"
+    [[ -n "$ports" ]] || err "Ports required"
+    validate_ports "$ports" || err "Invalid ports"
+  fi
+
   if [[ "$encrypt" == "1" ]]; then
-    read_tty -r -p "AES key (32 chars) [${key:-empty=auto}]: " tmp || true
+    read_tty -r -p "Shared password / AES key (32 chars) [${key:-empty=auto}]: " tmp || true
     if [[ -n "${tmp:-}" ]]; then
       key="$tmp"
     elif [[ -z "${key:-}" ]]; then
-      msg "Generating AES key..."
-      key="$(gen_key)" || err "AES key auto-generation failed"
-      echo -e "${YLW}Generated AES key (use SAME on other side):${NC} ${GRN}${key}${NC}"
+      msg "Generating 32-char key..."
+      key="$(gen_key)" || err "Key auto-generation failed"
+      echo -e "${YLW}Generated key (use SAME on other side):${NC} ${GRN}${key}${NC}"
     fi
-    [[ ${#key} -eq 32 ]] || err "AES key must be exactly 32 characters (got ${#key})"
+    [[ ${#key} -eq 32 ]] || err "Key must be exactly 32 characters (got ${#key})"
   else
     key=""
   fi
@@ -801,13 +910,17 @@ edit_tunnel() {
   ok "Edit applied on side=${side}"
   echo "  iran ip   : $iran_ip"
   echo "  kharej ip : $kh_ip"
-  echo "  proto     : $proto"
+  echo "  proto     : $proto   (saved in $CONF_ENV as PROTO=)"
   echo "  encrypt   : $encrypt"
-  [[ "$side" == "ir" ]] && echo "  ports     : $ports"
+  echo "  ports     : ${ports:-none}"
   if [[ "$encrypt" == "1" ]]; then
-    echo -e "  ${YLW}AES key   : ${key}${NC}"
+    echo -e "  ${YLW}key       : ${key}${NC}"
+    echo "  algorithm : ${ENC_ALGO_DEFAULT}  salt=${ENC_SALT_DEFAULT}"
+    if [[ "$side" == "kharej" ]]; then
+      echo -e "  ${YLW}Kharej panel must listen on 127.0.0.1 (same ports). WaterWall binds 10.10.0.1.${NC}"
+    fi
   fi
-  echo "  Apply the same IPs/proto/encrypt (and AES key) on the other server if you changed them."
+  echo "  Apply the same IPs / PROTO / encrypt / key / ports on the other server if you changed them."
 }
 
 prompt_install() {
@@ -830,18 +943,47 @@ prompt_install() {
   read_tty -r -p "Kharej public IP: " kh_ip
   validate_ip "$kh_ip" || err "Invalid Kharej IP"
 
+  echo
+  echo -e "${CYN}IP protocol number (protoswap)${NC}"
+  echo "  Saved as PROTO in tunnel.env; must be identical on Iran and Kharej."
+  echo "  You can change it later via menu 4) Edit tunnel."
   proto=51
-  read_tty -r -p "IP protocol number [${proto}]: " tmp || true
+  read_tty -r -p "Protocol number [${proto}]: " tmp || true
   [[ -n "${tmp:-}" ]] && proto="$tmp"
-  [[ "$proto" =~ ^[0-9]+$ ]] && ((proto >= 0 && proto <= 255)) || err "Invalid protocol"
+  [[ "$proto" =~ ^[0-9]+$ ]] && ((proto >= 0 && proto <= 255)) || err "Invalid protocol (0-255)"
 
+  # Default OFF until user opts in. Encryption uses built-in EncryptionClient/Server
+  # (docs), not the removed AesGcm dynamic library that crashed with:
+  #   library "AesGcm" ... could not be loaded
+  encrypt=0
+  echo
+  echo -e "${CYN}Encryption (optional, default OFF)${NC}"
+  echo "  Uses official AEAD nodes EncryptionClient + EncryptionServer (built into binary)."
+  echo "  Docs: https://radkesvat.github.io/WaterWall-Docs/docs/noderefs/EncryptionClient"
+  echo "  No libs/ plugin download is required. AesGcm plugin is NOT used."
+  read_tty -r -p "Enable EncryptionClient/Server? [y/N]: " tmp || true
+  case "${tmp:-N}" in
+    y|Y|yes|YES) encrypt=1 ;;
+    *) encrypt=0 ;;
+  esac
+
+  ports=""
   if [[ "$side" == "ir" ]]; then
     echo "Ports to forward from Iran 0.0.0.0 (space/comma separated)"
     read_tty -r -p "Ports [${default_ports}]: " ports
     ports="$(normalize_ports "${ports:-$default_ports}")"
     validate_ports "$ports" || err "Invalid ports"
+  elif [[ "$encrypt" == "1" ]]; then
+    echo "Kharej needs the SAME ports (EncryptionServer on 10.10.0.1 -> panel 127.0.0.1)"
+    if [[ -f "$CONF_ENV" ]]; then
+      # shellcheck disable=SC1090
+      source "$CONF_ENV"
+      ports="${PORTS:-}"
+    fi
+    read_tty -r -p "Ports [${ports:-$default_ports}]: " tmp || true
+    ports="$(normalize_ports "${tmp:-${ports:-$default_ports}}")"
+    validate_ports "$ports" || err "Invalid ports"
   else
-    ports=""
     if [[ -f "$CONF_ENV" ]]; then
       # shellcheck disable=SC1090
       source "$CONF_ENV"
@@ -849,32 +991,18 @@ prompt_install() {
     fi
   fi
 
-  # Default OFF: WaterWall 1.46.x release zips often ship a single binary without
-  # a loadable AesGcm shared library under libs/, which crashes with:
-  #   library "AesGcm" ... could not be loaded
-  encrypt=0
-  echo
-  echo -e "${YLW}Note:${NC} AesGcm encryption is OFF by default (more reliable)."
-  echo "      Official WaterWall binaries frequently lack the AesGcm plugin library."
-  read_tty -r -p "Enable AesGcm encryption anyway? [y/N]: " tmp || true
-  case "${tmp:-N}" in
-    y|Y|yes|YES) encrypt=1 ;;
-    *) encrypt=0 ;;
-  esac
-
   key=""
   if [[ "$encrypt" == "1" ]]; then
-    warn "AesGcm may crash if libs/AesGcm is missing from the WaterWall release."
-    read_tty -r -p "AES key (32 chars, empty=auto): " key || true
+    read_tty -r -p "Shared password / AES key (32 chars, empty=auto): " key || true
     if [[ -z "${key:-}" ]]; then
-      msg "Generating AES key..."
-      key="$(gen_key)" || err "AES key auto-generation failed"
+      msg "Generating 32-char key..."
+      key="$(gen_key)" || err "Key auto-generation failed"
       echo
-      echo -e "${YLW}Generated AES key (save + use SAME key on the other side):${NC}"
+      echo -e "${YLW}Generated key (save + use SAME key on the other side):${NC}"
       echo -e "  ${GRN}${key}${NC}"
       echo
     fi
-    [[ ${#key} -eq 32 ]] || err "AES key must be exactly 32 characters (got ${#key})"
+    [[ ${#key} -eq 32 ]] || err "Key must be exactly 32 characters (got ${#key})"
   fi
 
   oldcpu=0
@@ -890,6 +1018,10 @@ prompt_install() {
   ensure_deps
   download_waterwall "$oldcpu"
 
+  if [[ "$encrypt" == "1" ]]; then
+    ensure_encryption_support
+  fi
+
   msg "Writing core.json and tunnel config..."
   write_core_json "$side" "$mtu"
 
@@ -898,7 +1030,11 @@ prompt_install() {
     assert_ports_free "$ports"
     write_iran_config "$iran_ip" "$kh_ip" "$proto" "$encrypt" "$key" "$ports"
   else
-    write_kharej_config "$iran_ip" "$kh_ip" "$proto" "$encrypt" "$key"
+    if [[ "$encrypt" == "1" ]]; then
+      msg "Checking Kharej decrypt listen ports are free..."
+      assert_ports_free "$ports"
+    fi
+    write_kharej_config "$iran_ip" "$kh_ip" "$proto" "$encrypt" "$key" "$ports"
   fi
   ok "Config files written under $INSTALL_DIR"
 
@@ -945,15 +1081,26 @@ prompt_install() {
   echo "  watchdog : systemctl status ${SERVICE_NAME}-watchdog.timer"
   echo "  menu     : ww51"
   echo "  config   : $CONF_ENV"
+  echo "  PROTO    : $proto  (change anytime: sudo ww51 edit)"
   if [[ "$side" == "ir" ]]; then
     echo "  forward  : 0.0.0.0:{${ports// /,}} -> ${kh_ip} via 10.10.0.2"
-    echo "  note     : on Kharej, panel/xray must listen on the same ports (0.0.0.0 or 10.10.0.1)"
+    if [[ "$encrypt" == "1" ]]; then
+      echo "  encrypt  : EncryptionClient on each forward port"
+      echo "  note     : on Kharej enable encryption too; panel must listen on 127.0.0.1"
+    else
+      echo "  note     : on Kharej, panel/xray must listen on the same ports (0.0.0.0 or 10.10.0.1)"
+    fi
   else
     echo "  note     : start Kharej first, then Iran"
+    if [[ "$encrypt" == "1" ]]; then
+      echo -e "  ${YLW}panel    : bind to 127.0.0.1 on ports ${ports}${NC}"
+      echo "            WaterWall EncryptionServer listens on 10.10.0.1"
+    fi
   fi
   if [[ "$encrypt" == "1" ]]; then
-    echo -e "  ${YLW}AES key  : ${key}${NC}"
-    echo "            use the SAME key on both servers"
+    echo -e "  ${YLW}key      : ${key}${NC}"
+    echo "            use the SAME key + PROTO + ports on both servers"
+    echo "  algo     : ${ENC_ALGO_DEFAULT}  salt=${ENC_SALT_DEFAULT}"
   fi
 }
 
@@ -961,15 +1108,22 @@ change_ports() {
   [[ -f "$CONF_ENV" ]] || err "Not installed"
   # shellcheck disable=SC1090
   source "$CONF_ENV"
-  [[ "${SIDE}" == "ir" ]] || err "Port forward is configured on Iran side only"
+
+  # Iran always owns forward ports. Kharej needs the same list when encryption is on.
+  if [[ "${SIDE}" != "ir" && "${ENCRYPT:-0}" != "1" ]]; then
+    err "Port list is edited on Iran (or enable encryption on Kharej and use Edit tunnel)"
+  fi
 
   local ports
   read_tty -r -p "New ports (space/comma) [${PORTS}]: " ports
   ports="$(normalize_ports "${ports:-$PORTS}")"
   validate_ports "$ports" || err "Invalid ports"
 
-  apply_tunnel_config "ir" "$IRAN_IP" "$KHAREJ_IP" "$PROTO" "${ENCRYPT:-0}" "${AES_KEY:-}" "$ports" "${OLDCPU:-0}"
-  ok "Ports updated: $ports"
+  apply_tunnel_config "${SIDE}" "$IRAN_IP" "$KHAREJ_IP" "$PROTO" "${ENCRYPT:-0}" "${AES_KEY:-}" "$ports" "${OLDCPU:-0}"
+  ok "Ports updated: $ports (PROTO=${PROTO})"
+  if [[ "${SIDE}" == "ir" && "${ENCRYPT:-0}" == "1" ]]; then
+    warn "Also update the same ports on Kharej (sudo ww51 edit) so EncryptionServer matches."
+  fi
 }
 
 menu() {
@@ -980,10 +1134,12 @@ menu() {
     echo "1) Install / Reinstall"
     echo "2) Status"
     echo "3) Restart"
-    echo "4) Edit tunnel (IPs / ports / protocol)"
-    echo "5) Change Iran ports"
+    echo "4) Edit tunnel (IPs / PROTO / ports / encryption)"
+    echo "5) Change ports"
     echo "6) Uninstall"
     echo "0) Exit"
+    echo
+    echo -e "  Docs: ${CYN}https://radkesvat.github.io/WaterWall-Docs/docs/intro${NC}"
     echo
     read_tty -r -p "Select: " c || exit 0
     case "$c" in
