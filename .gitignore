@@ -6,5 +6,6 @@ libs/
 .DS_Store
 _diag_*
 _fix_*
+_live_*
 *.pem
 *.key
