@@ -148,6 +148,11 @@ normalize_ports() {
   echo "$raw" | tr ',;' '  ' | xargs
 }
 
+# When ENCRYPT=1, AEAD hops use INTERNAL_PORT = PUBLIC_PORT + PORT_OFFSET on the TUN.
+# Public panel ports stay untouched on Kharej (panel may keep 0.0.0.0:PUBLIC_PORT).
+PORT_OFFSET_DEFAULT=10000
+PORT_OFFSET="${PORT_OFFSET:-$PORT_OFFSET_DEFAULT}"
+
 validate_ports() {
   local p
   for p in $1; do
@@ -155,6 +160,41 @@ validate_ports() {
     ((p >= 1 && p <= 65535)) || return 1
   done
   return 0
+}
+
+validate_port_offset() {
+  local offset="${1:-$PORT_OFFSET}"
+  [[ "$offset" =~ ^[0-9]+$ ]] || return 1
+  ((offset >= 1 && offset <= 60000)) || return 1
+  return 0
+}
+
+validate_ports_with_offset() {
+  # Ensure PUBLIC+OFFSET fits in 1..65535 for every public port.
+  local ports="$1" offset="${2:-$PORT_OFFSET}" p iport
+  validate_port_offset "$offset" || return 1
+  for p in $ports; do
+    [[ "$p" =~ ^[0-9]+$ ]] || return 1
+    ((p >= 1 && p <= 65535)) || return 1
+    iport=$((p + offset))
+    ((iport >= 1 && iport <= 65535)) || return 1
+  done
+  return 0
+}
+
+internal_port() {
+  # PUBLIC_PORT -> INTERNAL_PORT for encrypted TUN hop
+  local p="$1" offset="${2:-$PORT_OFFSET}"
+  echo $((p + offset))
+}
+
+internal_ports_list() {
+  # "443 2053" + offset -> "10443 12053"
+  local ports="$1" offset="${2:-$PORT_OFFSET}" p out=""
+  for p in $ports; do
+    out+="$(internal_port "$p" "$offset") "
+  done
+  normalize_ports "$out"
 }
 
 ports_busy_report() {
@@ -176,7 +216,7 @@ ports_busy_report() {
 }
 
 assert_ports_free() {
-  # Iran TcpListeners need exclusive bind on 0.0.0.0:port.
+  # Iran TcpListeners need exclusive bind on 0.0.0.0:PUBLIC_PORT.
   local ports="$1" busy
   if busy="$(ports_busy_report "$ports")"; then
     echo -e "${RED}ERR${NC} These ports are already in use (WaterWall cannot bind):" >&2
@@ -187,33 +227,39 @@ assert_ports_free() {
   fi
 }
 
-warn_kharej_encrypt_port_conflict() {
-  # Explain why EncryptionServer cannot share ports with panel on *:PORT.
-  local busy="$1"
+warn_kharej_internal_port_conflict() {
+  # INTERNAL hop ports busy — do NOT ask user to free panel PUBLIC ports.
+  local busy="$1" offset="${2:-$PORT_OFFSET}"
   warn "============================================================"
-  warn "Kharej encryption needs TcpListener on 10.10.0.1:PORT -> EncryptionServer"
-  warn "-> TcpConnector(127.0.0.1:PORT). These ports are already in use:"
+  warn "Kharej encryption binds INTERNAL ports on 10.10.0.1:"
+  warn "  INTERNAL_PORT = PUBLIC_PORT + PORT_OFFSET (PORT_OFFSET=${offset})"
+  warn "These INTERNAL ports are already in use:"
   echo -e "$busy" >&2
-  warn "Linux blocks bind(10.10.0.1:PORT) when anything listens on *:PORT / 0.0.0.0:PORT"
-  warn "(typical: x-ui/xray). This installer will NOT touch your panel."
+  warn "Panel PUBLIC ports are fine (panel may stay on 0.0.0.0)."
+  warn "This installer will NOT touch x-ui/xray/nginx/panel."
   warn "Auto-fallback: ENCRYPT=0 so the packet tunnel stays UP."
-  warn "EN: Keep panel on 0.0.0.0 + encryption OFF, OR move panel to 127.0.0.1"
-  warn "    yourself on those ports, then re-run: sudo ww51 edit (encrypt=y)."
-  warn "FA: پنل روی 0.0.0.0 است؛ برای حفظ تونل رمزنگاری خاموش می‌ماند."
-  warn "    اگر خودتان پنل را روی 127.0.0.1 بگذارید، بعداً encrypt را روشن کنید."
+  warn "EN: Free the INTERNAL ports, or change PORT_OFFSET in tunnel.env, then:"
+  warn "    sudo ww51 edit (encrypt=y)."
+  warn "FA: پورت‌های داخلی تانل اشغال‌اند؛ پنل را جابه‌جا نکنید."
   warn "============================================================"
 }
 
 resolve_kharej_encrypt_bind_or_fallback() {
-  # If Kharej encrypt=1 but target ports are busy, force ENCRYPT_RESOLVED=0.
-  # Keeps KEY_RESOLVED so tunnel.env can retain AES_KEY for a later retry.
-  local encrypt="$1" key="$2" ports="$3" busy
+  # Kharej encrypt=1 binds INTERNAL ports only (PUBLIC+OFFSET), not panel PUBLIC ports.
+  # If INTERNAL ports are busy, force ENCRYPT_RESOLVED=0. Keep KEY_RESOLVED for retry.
+  local encrypt="$1" key="$2" ports="$3" offset="${4:-$PORT_OFFSET}" busy iports
   ENCRYPT_RESOLVED="$encrypt"
   KEY_RESOLVED="$key"
   [[ "$encrypt" == "1" ]] || return 0
   [[ -n "$ports" ]] || return 0
-  if busy="$(ports_busy_report "$ports")"; then
-    warn_kharej_encrypt_port_conflict "$busy"
+  validate_ports_with_offset "$ports" "$offset" || {
+    warn "Invalid PUBLIC ports / PORT_OFFSET=${offset} (PUBLIC+OFFSET must be <= 65535)"
+    ENCRYPT_RESOLVED=0
+    return 0
+  }
+  iports="$(internal_ports_list "$ports" "$offset")"
+  if busy="$(ports_busy_report "$iports")"; then
+    warn_kharej_internal_port_conflict "$busy" "$offset"
     ENCRYPT_RESOLVED=0
     return 0
   fi
@@ -223,8 +269,11 @@ resolve_kharej_encrypt_bind_or_fallback() {
 # Official docs:
 #   https://radkesvat.github.io/WaterWall-Docs/docs/noderefs/EncryptionClient
 #   https://radkesvat.github.io/WaterWall-Docs/docs/noderefs/EncryptionServer
-# Pattern: TcpListener -> EncryptionClient -> TcpConnector  (Iran)
-#          TcpListener -> EncryptionServer -> TcpConnector  (Kharej)
+# Encrypt hop (INTERNAL_PORT = PUBLIC_PORT + PORT_OFFSET, default +10000):
+#   Iran:   TcpListener(0.0.0.0:PUBLIC) -> EncryptionClient -> TcpConnector(10.10.0.2:INTERNAL)
+#   Kharej: TcpListener(10.10.0.1:INTERNAL) -> EncryptionServer -> TcpConnector(127.0.0.1:PUBLIC)
+# Iran MAY listen on 0.0.0.0 with encryption — that is fine.
+# Conflict was only Kharej EncryptionServer binding same PUBLIC port as panel on *:PORT.
 # AesGcm is NOT in WaterWall 1.46.x (no tunnel, no libs plugin) — do not use it.
 #
 # Docs default algorithm is chacha20-poly1305. old-cpu WaterWall builds often
@@ -360,9 +409,11 @@ resolve_encryption_or_fallback() {
 build_iran_forward_nodes() {
   # WaterWall 1.46+ auto-inserts TcpConnector.domain-resolver and does NOT allow
   # multiple listeners to share one connector next. Emit one chain per port.
-  # encrypt=1: TcpListener -> EncryptionClient -> TcpConnector(10.10.0.2:port)
-  local ports="$1" encrypt="$2" key="$3"
-  local p first=1 next_name
+  # encrypt=0: TcpListener(0.0.0.0:PUBLIC) -> TcpConnector(10.10.0.2:PUBLIC)
+  # encrypt=1: TcpListener(0.0.0.0:PUBLIC) -> EncryptionClient -> TcpConnector(10.10.0.2:INTERNAL)
+  #   INTERNAL = PUBLIC + PORT_OFFSET. Iran listen on 0.0.0.0 WITH encrypt is OK.
+  local ports="$1" encrypt="$2" key="$3" offset="${4:-$PORT_OFFSET}"
+  local p iport first=1 next_name
   for p in $ports; do
     if [[ $first -eq 1 ]]; then
       first=0
@@ -370,6 +421,7 @@ build_iran_forward_nodes() {
       printf ',\n'
     fi
     if [[ "$encrypt" == "1" ]]; then
+      iport="$(internal_port "$p" "$offset")"
       next_name="enc${p}"
       cat <<EOF
         {
@@ -399,7 +451,7 @@ build_iran_forward_nodes() {
             "settings": {
                 "nodelay": true,
                 "address": "10.10.0.2",
-                "port": ${p}
+                "port": ${iport}
             }
         }
 EOF
@@ -430,11 +482,12 @@ EOF
 }
 
 build_kharej_decrypt_nodes() {
-  # When encryption is ON, Kharej decrypts on the TUN IP then hands plain TCP
-  # to the panel on 127.0.0.1 (panel must NOT bind 0.0.0.0/10.10.0.1).
-  # TcpListener(10.10.0.1) -> EncryptionServer -> TcpConnector(127.0.0.1)
-  local ports="$1" key="$2"
-  local p first=1
+  # encrypt=1: bind INTERNAL on TUN, decrypt, connect to panel PUBLIC on loopback.
+  # TcpListener(10.10.0.1:INTERNAL) -> EncryptionServer -> TcpConnector(127.0.0.1:PUBLIC)
+  # Connecting to 127.0.0.1:PUBLIC is OK even if panel listens on 0.0.0.0:PUBLIC.
+  # Do NOT move panel; do NOT bind PUBLIC on 10.10.0.1 (that conflicted with *:PUBLIC).
+  local ports="$1" key="$2" offset="${3:-$PORT_OFFSET}"
+  local p iport first=1
   [[ -n "$ports" ]] || return 0
   for p in $ports; do
     if [[ $first -eq 1 ]]; then
@@ -442,13 +495,14 @@ build_kharej_decrypt_nodes() {
     else
       printf ',\n'
     fi
+    iport="$(internal_port "$p" "$offset")"
     cat <<EOF
         {
             "name": "p${p}",
             "type": "TcpListener",
             "settings": {
                 "address": "10.10.0.1",
-                "port": ${p},
+                "port": ${iport},
                 "nodelay": true
             },
             "next": "enc${p}"
@@ -525,10 +579,10 @@ EOF
 write_iran_config() {
   # Packet path stays unencrypted (TunDevice...RawSocket + protoswap).
   # Optional AEAD sits on the TCP forward chains (EncryptionClient).
-  local iran_ip="$1" kh_ip="$2" proto="$3" encrypt="$4" key="$5" ports="$6"
+  local iran_ip="$1" kh_ip="$2" proto="$3" encrypt="$4" key="$5" ports="$6" offset="${7:-$PORT_OFFSET}"
   local forward_nodes
 
-  forward_nodes="$(build_iran_forward_nodes "$ports" "$encrypt" "$key")"
+  forward_nodes="$(build_iran_forward_nodes "$ports" "$encrypt" "$key" "$offset")"
 
   cat > "${INSTALL_DIR}/config_ir.json" <<EOF
 {
@@ -607,12 +661,12 @@ EOF
 
 write_kharej_config() {
   # Packet path: TunDevice...RawSocket + protoswap (same PROTO as Iran).
-  # encrypt=1: add EncryptionServer listeners on 10.10.0.1 -> 127.0.0.1 panel.
-  local iran_ip="$1" kh_ip="$2" proto="$3" encrypt="$4" key="$5" ports="$6"
+  # encrypt=1: EncryptionServer on 10.10.0.1:INTERNAL -> panel 127.0.0.1:PUBLIC.
+  local iran_ip="$1" kh_ip="$2" proto="$3" encrypt="$4" key="$5" ports="$6" offset="${7:-$PORT_OFFSET}"
   local decrypt_nodes="" decrypt_block=""
 
   if [[ "$encrypt" == "1" ]]; then
-    decrypt_nodes="$(build_kharej_decrypt_nodes "$ports" "$key")"
+    decrypt_nodes="$(build_kharej_decrypt_nodes "$ports" "$key" "$offset")"
     [[ -n "$decrypt_nodes" ]] || err "Encryption enabled but no ports configured (needed on Kharej for EncryptionServer)"
     decrypt_block=",
 ${decrypt_nodes}"
@@ -696,6 +750,9 @@ write_env() {
   # PROTO = IpManipulator protoswap (0-255). ENCRYPT=1 uses EncryptionClient/Server.
   # AES_KEY is the shared Encryption password (32 chars). Not the removed AesGcm node.
   # ENC_ALGO is the probed AEAD (usually chacha20-poly1305 on old-cpu).
+  # PORT_OFFSET: INTERNAL_PORT = PUBLIC_PORT + PORT_OFFSET (encrypt hop on TUN).
+  local offset="${9:-$PORT_OFFSET}"
+  PORT_OFFSET="$offset"
   cat > "$CONF_ENV" <<EOF
 SIDE=$1
 IRAN_IP=$2
@@ -705,6 +762,7 @@ ENCRYPT=$5
 AES_KEY=$6
 PORTS="$7"
 OLDCPU=$8
+PORT_OFFSET=${offset}
 ENC_ALGO=${ENC_ALGO:-$ENC_ALGO_DEFAULT}
 ENC_SALT=${ENC_SALT_DEFAULT}
 EOF
@@ -897,7 +955,11 @@ show_status() {
     echo "  proto     : ${PROTO:-?}  (IpManipulator protoswap; editable via menu 4)"
     echo "  encrypt   : ${ENCRYPT:-0}  (0=off, 1=EncryptionClient/Server AEAD)"
     echo "  enc algo  : ${ENC_ALGO:-$ENC_ALGO_DEFAULT}"
-    echo "  ports     : ${PORTS:-?}"
+    echo "  ports     : ${PORTS:-?}  (public / Iran listen + Kharej panel)"
+    echo "  port+off  : ${PORT_OFFSET:-$PORT_OFFSET_DEFAULT}  (INTERNAL = PUBLIC + offset when encrypt=1)"
+    if [[ "${ENCRYPT:-0}" == "1" && -n "${PORTS:-}" ]]; then
+      echo "  internal  : $(internal_ports_list "$PORTS" "${PORT_OFFSET:-$PORT_OFFSET_DEFAULT}")  (TUN encrypt hop)"
+    fi
     echo "  old-cpu   : ${OLDCPU:-0}"
   else
     warn "No saved config at $CONF_ENV"
@@ -920,10 +982,12 @@ show_status() {
 
 apply_tunnel_config() {
   # Regenerate JSON from args and restart (no full reinstall).
-  # args: side iran_ip kh_ip proto encrypt key ports oldcpu
+  # args: side iran_ip kh_ip proto encrypt key ports oldcpu [port_offset]
   local side="$1" iran_ip="$2" kh_ip="$3" proto="$4" encrypt="$5" key="$6" ports="$7" oldcpu="$8"
+  local offset="${9:-${PORT_OFFSET:-$PORT_OFFSET_DEFAULT}}"
   local mtu
 
+  PORT_OFFSET="$offset"
   if [[ "$side" == "ir" ]]; then mtu=1320; else mtu=1380; fi
 
   if [[ "$encrypt" == "1" ]]; then
@@ -933,6 +997,8 @@ apply_tunnel_config() {
     if [[ "$encrypt" == "1" ]]; then
       [[ -n "$ports" ]] || err "Encryption requires PORTS on both sides (same list)"
       [[ ${#key} -eq 32 ]] || err "Encryption password must be exactly 32 characters"
+      validate_ports_with_offset "$ports" "$offset" \
+        || err "Invalid ports/PORT_OFFSET=${offset} (each PUBLIC+OFFSET must be 1..65535)"
     fi
   else
     ENC_ALGO="${ENC_ALGO:-$ENC_ALGO_DEFAULT}"
@@ -942,29 +1008,34 @@ apply_tunnel_config() {
   systemctl stop "${SERVICE_NAME}.service" 2>/dev/null || true
   sleep 1
 
-  # Kharej encrypt bind check AFTER stop (own listeners gone). If panel owns *:PORT,
-  # auto-fallback — never hard-fail and leave the tunnel down.
+  # Kharej encrypt: check INTERNAL ports only (not panel PUBLIC ports).
   if [[ "$side" == "kharej" && "$encrypt" == "1" ]]; then
-    resolve_kharej_encrypt_bind_or_fallback "$encrypt" "$key" "$ports"
+    resolve_kharej_encrypt_bind_or_fallback "$encrypt" "$key" "$ports" "$offset"
     encrypt="$ENCRYPT_RESOLVED"
     key="$KEY_RESOLVED"
   fi
 
   write_core_json "$side" "$mtu"
   if [[ "$side" == "ir" ]]; then
+    # Iran always needs exclusive PUBLIC listen ports (encrypt or not).
     assert_ports_free "$ports"
-    write_iran_config "$iran_ip" "$kh_ip" "$proto" "$encrypt" "$key" "$ports"
+    write_iran_config "$iran_ip" "$kh_ip" "$proto" "$encrypt" "$key" "$ports" "$offset"
   else
-    write_kharej_config "$iran_ip" "$kh_ip" "$proto" "$encrypt" "$key" "$ports"
+    write_kharej_config "$iran_ip" "$kh_ip" "$proto" "$encrypt" "$key" "$ports" "$offset"
   fi
-  write_env "$side" "$iran_ip" "$kh_ip" "$proto" "$encrypt" "$key" "$ports" "$oldcpu"
+  write_env "$side" "$iran_ip" "$kh_ip" "$proto" "$encrypt" "$key" "$ports" "$oldcpu" "$offset"
   write_service
   systemctl daemon-reload || true
   systemctl enable "${SERVICE_NAME}.service" || warn "Could not enable ${SERVICE_NAME}.service"
   systemctl restart "${SERVICE_NAME}.service" || true
   sleep 2
   if [[ "$(systemctl is-active "${SERVICE_NAME}.service" 2>/dev/null || true)" == "active" ]]; then
-    ok "Tunnel config applied; service active (PROTO=${proto} ENCRYPT=${encrypt} ALGO=${ENC_ALGO})"
+    if [[ "$encrypt" == "1" ]]; then
+      ok "Tunnel config applied; service active (PROTO=${proto} ENCRYPT=1 ALGO=${ENC_ALGO} OFFSET=${offset})"
+      ok "Encrypt hop INTERNAL ports: $(internal_ports_list "$ports" "$offset")"
+    else
+      ok "Tunnel config applied; service active (PROTO=${proto} ENCRYPT=0)"
+    fi
     return 0
   fi
   show_failure_logs
@@ -976,7 +1047,7 @@ edit_tunnel() {
   # shellcheck disable=SC1090
   source "$CONF_ENV"
 
-  local side iran_ip kh_ip ports proto encrypt key oldcpu tmp
+  local side iran_ip kh_ip ports proto encrypt key oldcpu offset tmp
   side="${SIDE:-}"
   iran_ip="${IRAN_IP:-}"
   kh_ip="${KHAREJ_IP:-}"
@@ -985,6 +1056,8 @@ edit_tunnel() {
   encrypt="${ENCRYPT:-0}"
   key="${AES_KEY:-}"
   oldcpu="${OLDCPU:-0}"
+  offset="${PORT_OFFSET:-$PORT_OFFSET_DEFAULT}"
+  PORT_OFFSET="$offset"
   ENC_ALGO="${ENC_ALGO:-$ENC_ALGO_DEFAULT}"
 
   [[ -n "$side" && -n "$iran_ip" && -n "$kh_ip" ]] || err "tunnel.env incomplete; reinstall"
@@ -1013,11 +1086,13 @@ edit_tunnel() {
   [[ "$encrypt" == "1" ]] && enc_prompt="Y"
   echo
   echo -e "${CYN}Encryption${NC} (official WaterWall AEAD nodes — NOT the removed AesGcm plugin)"
-  echo "  Iran  : TcpListener -> EncryptionClient -> TcpConnector(10.10.0.2:PORT)"
-  echo "  Kharej: TcpListener(10.10.0.1:PORT) -> EncryptionServer -> TcpConnector(127.0.0.1:PORT)"
+  echo "  Iran  : TcpListener(0.0.0.0:PUBLIC) -> EncryptionClient -> TcpConnector(10.10.0.2:INTERNAL)"
+  echo "  Kharej: TcpListener(10.10.0.1:INTERNAL) -> EncryptionServer -> TcpConnector(127.0.0.1:PUBLIC)"
+  echo "  INTERNAL = PUBLIC + PORT_OFFSET (default ${PORT_OFFSET_DEFAULT}; e.g. 443 -> 10443)"
+  echo "  Iran MAY use 0.0.0.0 WITH encryption — that is fine."
+  echo "  Kharej panel may stay on 0.0.0.0:PUBLIC — installer never moves panel/x-ui."
   echo "  Docs  : https://radkesvat.github.io/WaterWall-Docs/docs/noderefs/EncryptionClient"
   echo "  Algo  : auto-probe (prefer chacha20-poly1305; current saved: ${ENC_ALGO:-$ENC_ALGO_DEFAULT})"
-  echo "  Note  : on Kharej, panel on *:PORT conflicts — script keeps tunnel UP and falls back to OFF."
   echo "  Default OFF for safety. No libs/ plugin required (nodes are built into the binary)."
   read_tty -r -p "Enable EncryptionClient/Server? [y/N] (current: ${enc_prompt}): " tmp || true
   case "${tmp:-}" in
@@ -1028,24 +1103,24 @@ edit_tunnel() {
   esac
 
   # Ports: always prompted on Iran. On Kharej only when encryption is on
-  # (EncryptionServer needs the same PORT list). If already saved, auto-use.
+  # (same PUBLIC list; INTERNAL hop uses PUBLIC+PORT_OFFSET).
   if [[ "$side" == "ir" ]]; then
-    read_tty -r -p "Listen / forward ports [${ports:-80 443}]: " tmp || true
+    read_tty -r -p "Listen / forward ports (PUBLIC) [${ports:-80 443}]: " tmp || true
     [[ -n "${tmp:-}" ]] && ports="$(normalize_ports "$tmp")"
     ports="$(normalize_ports "${ports:-}")"
     [[ -n "$ports" ]] || err "Ports required"
     validate_ports "$ports" || err "Invalid ports"
   elif [[ "$encrypt" == "1" ]]; then
     echo
-    echo -e "${CYN}Kharej EncryptionServer ports${NC}"
-    echo "  Why: encrypt ON needs listeners on 10.10.0.1 using the SAME ports as Iran."
-    echo "  (Not for the public NIC — only for the TUN decrypt path.)"
+    echo -e "${CYN}Kharej PUBLIC ports (same list as Iran)${NC}"
+    echo "  WaterWall binds INTERNAL=PUBLIC+${offset} on 10.10.0.1 (not PUBLIC)."
+    echo "  Panel keeps 0.0.0.0:PUBLIC — connecting to 127.0.0.1:PUBLIC is OK."
     if [[ -n "${ports:-}" ]]; then
       echo -e "  Auto-using saved PORTS from tunnel.env: ${GRN}${ports}${NC}"
       read_tty -r -p "Press Enter to keep, or type new ports: " tmp || true
       [[ -n "${tmp:-}" ]] && ports="$(normalize_ports "$tmp")"
     else
-      read_tty -r -p "Same ports as Iran [80 443]: " tmp || true
+      read_tty -r -p "Same PUBLIC ports as Iran [80 443]: " tmp || true
       ports="$(normalize_ports "${tmp:-80 443}")"
     fi
     ports="$(normalize_ports "${ports:-}")"
@@ -1054,6 +1129,14 @@ edit_tunnel() {
   fi
 
   if [[ "$encrypt" == "1" ]]; then
+    read_tty -r -p "PORT_OFFSET for INTERNAL hop [${offset}]: " tmp || true
+    [[ -n "${tmp:-}" ]] && offset="$tmp"
+    validate_port_offset "$offset" || err "Invalid PORT_OFFSET (1..60000)"
+    validate_ports_with_offset "$ports" "$offset" \
+      || err "PUBLIC+PORT_OFFSET must be <= 65535 for all ports"
+    PORT_OFFSET="$offset"
+    echo "  INTERNAL ports will be: $(internal_ports_list "$ports" "$offset")"
+
     read_tty -r -p "Shared password / AES key (32 chars) [${key:-empty=auto}]: " tmp || true
     if [[ -n "${tmp:-}" ]]; then
       key="$tmp"
@@ -1088,8 +1171,16 @@ edit_tunnel() {
     cp -f "${BASH_SOURCE[0]}" "${INSTALL_DIR}/install.sh" 2>/dev/null || true
   fi
 
-  apply_tunnel_config "$side" "$iran_ip" "$kh_ip" "$proto" "$encrypt" "$key" "$ports" "$oldcpu"
+  apply_tunnel_config "$side" "$iran_ip" "$kh_ip" "$proto" "$encrypt" "$key" "$ports" "$oldcpu" "$offset"
   enable_watchdog
+
+  # Re-read resolved encrypt after possible fallback
+  if [[ -f "$CONF_ENV" ]]; then
+    # shellcheck disable=SC1090
+    source "$CONF_ENV"
+    encrypt="${ENCRYPT:-$encrypt}"
+    offset="${PORT_OFFSET:-$offset}"
+  fi
 
   echo
   ok "Edit applied on side=${side}"
@@ -1097,23 +1188,23 @@ edit_tunnel() {
   echo "  kharej ip : $kh_ip"
   echo "  proto     : $proto   (saved in $CONF_ENV as PROTO=)"
   echo "  encrypt   : $encrypt"
-  echo "  ports     : ${ports:-none}"
+  echo "  ports     : ${ports:-none}  (PUBLIC)"
+  echo "  offset    : $offset"
   if [[ "$encrypt" == "1" ]]; then
     echo -e "  ${YLW}key       : ${key}${NC}"
     echo "  algorithm : ${ENC_ALGO:-$ENC_ALGO_DEFAULT}  salt=${ENC_SALT_DEFAULT}"
-    if [[ "$side" == "kharej" ]]; then
-      echo -e "  ${YLW}Panel must listen on 127.0.0.1 (same ports). WaterWall binds 10.10.0.1.${NC}"
-      echo "  (Installer never moves your panel; conflict => encrypt stays OFF.)"
-    fi
+    echo "  internal  : $(internal_ports_list "$ports" "$offset")  (TUN encrypt hop)"
+    echo "  panel     : may stay on 0.0.0.0:PUBLIC (installer never moves it)"
   else
     echo "  encrypt  : off (packet tunnel only; panel may stay on 0.0.0.0)"
   fi
-  echo "  Apply the same IPs / PROTO / encrypt / key / ports / algorithm on the other server if you changed them."
+  echo "  Apply the same IPs / PROTO / encrypt / key / ports / PORT_OFFSET / algorithm on the other server if you changed them."
 }
 
 prompt_install() {
-  local side iran_ip kh_ip ports proto encrypt key oldcpu mtu default_ports
+  local side iran_ip kh_ip ports proto encrypt key oldcpu offset mtu default_ports
   default_ports="80 443 2053 2083 2087 2096 8080 8443 8880"
+  offset="$PORT_OFFSET_DEFAULT"
 
   echo
   echo -e "${CYN}Select side:${NC}"
@@ -1148,6 +1239,8 @@ prompt_install() {
   echo -e "${CYN}Encryption (optional, default OFF)${NC}"
   echo "  Uses official AEAD nodes EncryptionClient + EncryptionServer (built into binary)."
   echo "  Docs: https://radkesvat.github.io/WaterWall-Docs/docs/noderefs/EncryptionClient"
+  echo "  Encrypt hop uses INTERNAL ports on TUN: INTERNAL = PUBLIC + PORT_OFFSET (default ${PORT_OFFSET_DEFAULT})."
+  echo "  Iran 0.0.0.0 + encryption is OK. Kharej panel may stay on 0.0.0.0:PUBLIC (never moved)."
   echo "  Algorithm auto-selected after download (prefer chacha20-poly1305; aes-gcm only if usable)."
   echo "  old-cpu binaries: AES-GCM is unavailable — script uses chacha20-poly1305 or falls back to OFF."
   echo "  No libs/ plugin download is required. AesGcm plugin is NOT used."
@@ -1160,27 +1253,27 @@ prompt_install() {
   ports=""
   if [[ -f "$CONF_ENV" ]]; then
     # shellcheck disable=SC1090
-    # Keep previously saved PORTS / AES_KEY hints when reinstalling.
+    # Keep previously saved PORTS / AES_KEY / PORT_OFFSET hints when reinstalling.
     source "$CONF_ENV"
     ports="${PORTS:-}"
+    offset="${PORT_OFFSET:-$PORT_OFFSET_DEFAULT}"
   fi
   if [[ "$side" == "ir" ]]; then
-    echo "Ports to forward from Iran 0.0.0.0 (space/comma separated)"
+    echo "PUBLIC ports to forward from Iran 0.0.0.0 (space/comma separated)"
     read_tty -r -p "Ports [${ports:-$default_ports}]: " tmp || true
     ports="$(normalize_ports "${tmp:-${ports:-$default_ports}}")"
     validate_ports "$ports" || err "Invalid ports"
   elif [[ "$encrypt" == "1" ]]; then
     echo
-    echo -e "${CYN}Kharej EncryptionServer ports${NC}"
-    echo "  Why: encrypt ON binds TcpListener on 10.10.0.1:PORT (same list as Iran),"
-    echo "  then EncryptionServer -> panel on 127.0.0.1:PORT."
-    echo "  If x-ui/xray already owns *:PORT, installer auto-falls back to encrypt OFF."
+    echo -e "${CYN}Kharej PUBLIC ports (same list as Iran)${NC}"
+    echo "  WaterWall binds INTERNAL=PUBLIC+PORT_OFFSET on 10.10.0.1 (not PUBLIC)."
+    echo "  Panel may keep 0.0.0.0:PUBLIC — installer never touches x-ui/xray."
     if [[ -n "${ports:-}" ]]; then
       echo -e "  Auto-using saved PORTS from tunnel.env: ${GRN}${ports}${NC}"
       read_tty -r -p "Press Enter to keep, or type new ports: " tmp || true
       [[ -n "${tmp:-}" ]] && ports="$(normalize_ports "$tmp")"
     else
-      read_tty -r -p "Same ports as Iran [${default_ports}]: " tmp || true
+      read_tty -r -p "Same PUBLIC ports as Iran [${default_ports}]: " tmp || true
       ports="$(normalize_ports "${tmp:-$default_ports}")"
     fi
     ports="$(normalize_ports "${ports:-}")"
@@ -1189,6 +1282,14 @@ prompt_install() {
 
   key=""
   if [[ "$encrypt" == "1" ]]; then
+    read_tty -r -p "PORT_OFFSET for INTERNAL hop [${offset}]: " tmp || true
+    [[ -n "${tmp:-}" ]] && offset="$tmp"
+    validate_port_offset "$offset" || err "Invalid PORT_OFFSET (1..60000)"
+    validate_ports_with_offset "$ports" "$offset" \
+      || err "PUBLIC+PORT_OFFSET must be <= 65535 for all ports"
+    PORT_OFFSET="$offset"
+    echo "  INTERNAL ports will be: $(internal_ports_list "$ports" "$offset")"
+
     read_tty -r -p "Shared password / AES key (32 chars, empty=auto): " key || true
     if [[ -z "${key:-}" ]]; then
       msg "Generating 32-char key..."
@@ -1226,20 +1327,20 @@ prompt_install() {
   write_core_json "$side" "$mtu"
 
   if [[ "$side" == "ir" ]]; then
-    msg "Checking Iran listen ports are free..."
+    msg "Checking Iran PUBLIC listen ports are free..."
     assert_ports_free "$ports"
-    write_iran_config "$iran_ip" "$kh_ip" "$proto" "$encrypt" "$key" "$ports"
+    write_iran_config "$iran_ip" "$kh_ip" "$proto" "$encrypt" "$key" "$ports" "$offset"
   else
     if [[ "$encrypt" == "1" ]]; then
-      msg "Checking Kharej EncryptionServer ports (10.10.0.1 / any *:PORT conflict)..."
+      msg "Checking Kharej INTERNAL encrypt ports (PUBLIC+${offset}) are free..."
       # Stop existing unit first so we do not false-positive on our own listeners.
       systemctl stop "${SERVICE_NAME}.service" 2>/dev/null || true
       sleep 1
-      resolve_kharej_encrypt_bind_or_fallback "$encrypt" "$key" "$ports"
+      resolve_kharej_encrypt_bind_or_fallback "$encrypt" "$key" "$ports" "$offset"
       encrypt="$ENCRYPT_RESOLVED"
       key="$KEY_RESOLVED"
     fi
-    write_kharej_config "$iran_ip" "$kh_ip" "$proto" "$encrypt" "$key" "$ports"
+    write_kharej_config "$iran_ip" "$kh_ip" "$proto" "$encrypt" "$key" "$ports" "$offset"
   fi
   ok "Config files written under $INSTALL_DIR"
 
@@ -1254,7 +1355,7 @@ prompt_install() {
   chmod +x "${INSTALL_DIR}/install.sh" 2>/dev/null || true
 
   msg "Writing config (tunnel.env)..."
-  write_env "$side" "$iran_ip" "$kh_ip" "$proto" "$encrypt" "$key" "$ports" "$oldcpu"
+  write_env "$side" "$iran_ip" "$kh_ip" "$proto" "$encrypt" "$key" "$ports" "$oldcpu" "$offset"
   [[ -f "$CONF_ENV" ]] || err "Failed to write $CONF_ENV"
 
   msg "Installing systemd unit..."
@@ -1290,24 +1391,26 @@ prompt_install() {
   if [[ "$side" == "ir" ]]; then
     echo "  forward  : 0.0.0.0:{${ports// /,}} -> ${kh_ip} via 10.10.0.2"
     if [[ "$encrypt" == "1" ]]; then
-      echo "  encrypt  : EncryptionClient on each forward port"
-      echo "  note     : on Kharej enable encryption too; panel must listen on 127.0.0.1"
-      echo "            (Kharej installer never moves panel; port conflict => encrypt OFF)"
+      echo "  encrypt  : EncryptionClient on PUBLIC ports; hop to INTERNAL on TUN"
+      echo "  internal : $(internal_ports_list "$ports" "$offset")  (PORT_OFFSET=${offset})"
+      echo "  note     : on Kharej enable encryption too (same key/PROTO/ports/offset)"
+      echo "            panel may stay on 0.0.0.0:PUBLIC — never moved by this installer"
     else
       echo "  note     : on Kharej, panel/xray may listen on the same ports (0.0.0.0 or 10.10.0.1)"
     fi
   else
     echo "  note     : start Kharej first, then Iran"
     if [[ "$encrypt" == "1" ]]; then
-      echo -e "  ${YLW}panel    : bind to 127.0.0.1 on ports ${ports}${NC}"
-      echo "            WaterWall EncryptionServer listens on 10.10.0.1"
+      echo "  encrypt  : EncryptionServer on 10.10.0.1:INTERNAL -> 127.0.0.1:PUBLIC"
+      echo "  internal : $(internal_ports_list "$ports" "$offset")  (PORT_OFFSET=${offset})"
+      echo "  panel    : may stay on 0.0.0.0:PUBLIC (installer never touches x-ui)"
     else
       echo "  encrypt  : off (compatible with panel on 0.0.0.0)"
     fi
   fi
   if [[ "$encrypt" == "1" ]]; then
     echo -e "  ${YLW}key      : ${key}${NC}"
-    echo "            use the SAME key + PROTO + ports + algorithm on both servers"
+    echo "            use the SAME key + PROTO + ports + PORT_OFFSET + algorithm on both servers"
     echo "  algo     : ${ENC_ALGO:-$ENC_ALGO_DEFAULT}  salt=${ENC_SALT_DEFAULT}"
     echo "            old-cpu binaries use chacha20-poly1305 (AES-GCM unavailable)"
   else
@@ -1322,7 +1425,8 @@ apply_from_env() {
   source "$CONF_ENV"
   [[ -n "${SIDE:-}" && -n "${IRAN_IP:-}" && -n "${KHAREJ_IP:-}" ]] || err "tunnel.env incomplete"
   ENC_ALGO="${ENC_ALGO:-$ENC_ALGO_DEFAULT}"
-  apply_tunnel_config "${SIDE}" "$IRAN_IP" "$KHAREJ_IP" "${PROTO:-51}" "${ENCRYPT:-0}" "${AES_KEY:-}" "${PORTS:-}" "${OLDCPU:-0}"
+  PORT_OFFSET="${PORT_OFFSET:-$PORT_OFFSET_DEFAULT}"
+  apply_tunnel_config "${SIDE}" "$IRAN_IP" "$KHAREJ_IP" "${PROTO:-51}" "${ENCRYPT:-0}" "${AES_KEY:-}" "${PORTS:-}" "${OLDCPU:-0}" "$PORT_OFFSET"
   enable_watchdog
 }
 
@@ -1336,15 +1440,20 @@ change_ports() {
     err "Port list is edited on Iran (or enable encryption on Kharej and use Edit tunnel)"
   fi
 
-  local ports
-  read_tty -r -p "New ports (space/comma) [${PORTS}]: " ports
+  local ports offset
+  offset="${PORT_OFFSET:-$PORT_OFFSET_DEFAULT}"
+  read_tty -r -p "New PUBLIC ports (space/comma) [${PORTS}]: " ports
   ports="$(normalize_ports "${ports:-$PORTS}")"
   validate_ports "$ports" || err "Invalid ports"
+  if [[ "${ENCRYPT:-0}" == "1" ]]; then
+    validate_ports_with_offset "$ports" "$offset" \
+      || err "PUBLIC+PORT_OFFSET=${offset} must be <= 65535 for all ports"
+  fi
 
-  apply_tunnel_config "${SIDE}" "$IRAN_IP" "$KHAREJ_IP" "$PROTO" "${ENCRYPT:-0}" "${AES_KEY:-}" "$ports" "${OLDCPU:-0}"
-  ok "Ports updated: $ports (PROTO=${PROTO})"
+  apply_tunnel_config "${SIDE}" "$IRAN_IP" "$KHAREJ_IP" "$PROTO" "${ENCRYPT:-0}" "${AES_KEY:-}" "$ports" "${OLDCPU:-0}" "$offset"
+  ok "Ports updated: $ports (PROTO=${PROTO} OFFSET=${offset})"
   if [[ "${SIDE}" == "ir" && "${ENCRYPT:-0}" == "1" ]]; then
-    warn "Also update the same ports on Kharej (sudo ww51 edit) so EncryptionServer matches."
+    warn "Also update the same PUBLIC ports + PORT_OFFSET on Kharej (sudo ww51 edit)."
   fi
 }
 

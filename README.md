@@ -44,7 +44,7 @@ sudo bash install.sh
 ### تغییر شماره پروتکل (PROTO)
 
 1. روی **هر دو** سرور: `sudo ww51` → گزینه **4) Edit tunnel**
-2. مقدار `Protocol` را عوض کن (مثلاً `51` → `53`) — بازه معتبر `0..255`
+2. مقدار `Protocol` را عوض کن (مثلاً `51` → `58`) — بازه معتبر `0..255`
 3. اسکریپت کانفیگ را از نو می‌نویسد، `PROTO=` را در `tunnel.env` ذخیره می‌کند و سرویس را ری‌استارت می‌کند
 4. **همان عدد** باید روی ایران و خارج تنظیم شود
 
@@ -61,9 +61,9 @@ grep ^PROTO= /opt/waterwall-proto51/tunnel.env
 | مورد | توضیح |
 |------|--------|
 | پروتکل | پیش‌فرض `51`؛ در Install و Edit قابل تغییر؛ ذخیره در `tunnel.env` به‌صورت `PROTO=` و اعمال در `IpManipulator.protoswap` |
-| ایران | `TcpListener` روی `0.0.0.0` برای پورت‌های انتخابی → فوروارد به `10.10.0.2` (یک جفت listener/connector به‌ازای هر پورت) |
-| خارج | endpoint تانل؛ بدون رمزنگاری پنل روی همان پورت‌ها گوش می‌دهد |
-| رمزنگاری | **پیش‌فرض خاموش**؛ با `EncryptionClient`/`EncryptionServer` (داخل باینری رسمی، بدون `libs/`) |
+| ایران | `TcpListener` روی `0.0.0.0` برای پورت‌های PUBLIC → فوروارد به `10.10.0.2` |
+| خارج | endpoint تانل؛ بدون رمزنگاری پنل روی همان پورت‌های PUBLIC گوش می‌دهد (`0.0.0.0` OK) |
+| رمزنگاری | **پیش‌فرض خاموش**؛ با `EncryptionClient`/`EncryptionServer` روی پورت‌های **داخلی تانل** (`INTERNAL = PUBLIC + PORT_OFFSET`) |
 | سرویس | `systemd` با نام `waterwall-proto51` — `enable` شده تا بعد از ریبوت خودکار بالا بیاید (`Restart=always`) |
 | Watchdog | تایمر `waterwall-proto51-watchdog.timer` هر ~۲ دقیقه سرویس/`wtun0` را چک می‌کند |
 | باینری | دانلود از [radkesvat/WaterWall](https://github.com/radkesvat/WaterWall/releases) |
@@ -76,22 +76,49 @@ TunDevice -> IpOverrider -> IpOverrider -> IpManipulator(protoswap=PROTO) -> IpO
 
 ### رمزنگاری وقتی روشن است (روی استریم TCP فوروارد)
 
-طبق [مستندات رسمی](https://radkesvat.github.io/WaterWall-Docs/docs/noderefs/EncryptionClient):
-
 ```text
-Iran:   TcpListener -> EncryptionClient -> TcpConnector(10.10.0.2:port)
-Kharej: TcpListener(10.10.0.1) -> EncryptionServer -> TcpConnector(127.0.0.1:port)
+Iran:   TcpListener(0.0.0.0:PUBLIC) -> EncryptionClient -> TcpConnector(10.10.0.2:INTERNAL)
+Kharej: TcpListener(10.10.0.1:INTERNAL) -> EncryptionServer -> TcpConnector(127.0.0.1:PUBLIC)
 ```
+
+**INTERNAL_PORT = PUBLIC_PORT + PORT_OFFSET** (پیش‌فرض `PORT_OFFSET=10000`)
+
+مثال: `443 → 10443`، `2053 → 12053`، `8443 → 18443`، `2083 → 12083`
+
+ذخیره در `tunnel.env`:
+
+```bash
+PORT_OFFSET=10000
+PORTS="443 2053 8443 2083"
+```
+
+#### نکات مهم (UX)
+
+- **ایران می‌تواند روی `0.0.0.0` با رمزنگاری گوش بدهد** — این مشکلی ندارد.
+- تداخل قبلی فقط وقتی بود که روی خارج `EncryptionServer` همان **PUBLIC** پورت پنل را روی `*:PORT` بایند می‌کرد.
+- حالا WaterWall روی خارج فقط **INTERNAL** را روی `10.10.0.1` بایند می‌کند؛ پنل می‌تواند روی `0.0.0.0:PUBLIC` بماند.
+- اتصال به `127.0.0.1:PUBLIC` روی خارج OK است حتی اگر پنل روی `0.0.0.0:PUBLIC` گوش بدهد.
+- این نصب‌کننده **هرگز** x-ui / xray / nginx / listen پنل را عوض نمی‌کند و از شما نمی‌خواهد پورت پنل را آزاد کنید.
+
+#### چک اشغال بودن پورت
+
+| سمت | چه چیزی چک می‌شود |
+|------|-------------------|
+| ایران | پورت‌های **PUBLIC** روی `0.0.0.0` (مثل قبل) |
+| خارج + encrypt | فقط پورت‌های **INTERNAL** آزاد باشند — **نه** پورت‌های PUBLIC پنل |
+
+اگر INTERNAL اشغال بود: هشدار + `ENCRYPT=0` (تانل بالا می‌ماند). پنل را جابه‌جا نکنید.
+
+#### الگوریتم و کلید
 
 - الگوریتم: بعد از دانلود باینری **پروب** می‌شود و در `tunnel.env` به‌صورت `ENC_ALGO=` ذخیره می‌گردد
   - ترجیح: `chacha20-poly1305` (پیش‌فرض مستندات رسمی؛ بدون AES-NI کار می‌کند)
   - جایگزین: `aes-gcm` فقط وقتی باینری/CPU پشتیبانی کند
-  - باینری **old-cpu**: معمولاً AES-GCM در crypto backend نیست → اسکریپت `chacha20-poly1305` می‌نویسد (نه `aes-gcm` که FATAL می‌دهد)
-  - اگر هیچ AEAD در دسترس نباشد: هشدار واضح + نصب **بدون** رمزنگاری (به‌جای کرش)
+  - باینری **old-cpu**: معمولاً AES-GCM در crypto backend نیست → اسکریپت `chacha20-poly1305` می‌نویسد
+  - اگر هیچ AEAD در دسترس نباشد: هشدار واضح + نصب **بدون** رمزنگاری
 - salt ثابت: `waterwall-proto51`
 - کلید/پسورد مشترک: دقیقاً **۳۲ کاراکتر**؛ اگر خالی بگذاری خودکار ساخته و چاپ می‌شود
-- هر دو طرف باید همان کلید، همان پورت‌ها، همان `PROTO` و همان `ENC_ALGO` را داشته باشند
-- روی خارج وقتی رمزنگاری روشن است، **پنل/Xray باید روی `127.0.0.1` گوش بدهد** (WaterWall روی `10.10.0.1` بایند می‌کند)
+- هر دو طرف باید همان کلید، همان پورت‌های PUBLIC، همان `PORT_OFFSET`، همان `PROTO` و همان `ENC_ALGO` را داشته باشند
 
 ### چرا دیگر `AesGcm` نیست؟
 
@@ -101,7 +128,7 @@ Kharej: TcpListener(10.10.0.1) -> EncryptionServer -> TcpConnector(127.0.0.1:por
 library "AesGcm" (hash: ...) could not be loaded
 ```
 
-راه‌حل درست: نودهای رسمی و استاتیک `EncryptionClient` / `EncryptionServer` (نیازی به دانلود `libs/` نیست). اگر رمزنگاری را روشن کنی و باینری این نودها را نداشته باشد، نصب **قبل از استارت** با پیام واضح قطع می‌شود.
+راه‌حل درست: نودهای رسمی و استاتیک `EncryptionClient` / `EncryptionServer` (نیازی به دانلود `libs/` نیست).
 
 ## پورت‌های پیش‌فرض ایران
 
@@ -138,11 +165,12 @@ sudo ww51 status
 
 1. اول **خارج** (`sudo ww51` → Edit یا Install):
    - `Enable EncryptionClient/Server?` → `y`
-   - همان پورت‌های ایران را وارد کن
+   - همان پورت‌های PUBLIC ایران + همان `PORT_OFFSET` (پیش‌فرض `10000`)
    - کلید ۳۲ کاراکتری را بساز/کپی کن
-   - پنل را روی `127.0.0.1` روی همان پورت‌ها تنظیم کن
+   - **پنل را جابه‌جا نکن** — می‌تواند روی `0.0.0.0` بماند
 2. بعد **ایران**:
-   - رمزنگاری `y` + **همان کلید** + همان پورت‌ها + همان `PROTO`
+   - رمزنگاری `y` + **همان کلید** + همان پورت‌ها + همان `PORT_OFFSET` + همان `PROTO`
+   - ایران روی `0.0.0.0:PUBLIC` گوش می‌دهد (با رمز هم OK)
 3. Status را روی هر دو چک کن؛ اگر سرویس down بود: `journalctl -u waterwall-proto51 -n 50 --no-pager`
 
 ## دستورات مفید
@@ -162,8 +190,8 @@ cat /opt/waterwall-proto51/tunnel.env
 
 1. اول سرور **خارج** را نصب/استارت کن، بعد **ایران**.
 2. بدون رمزنگاری: روی خارج سرویس (Xray/پنل) روی همان پورت‌ها روی `0.0.0.0` یا `10.10.0.1` گوش بدهد.
-3. با رمزنگاری: روی خارج پنل روی `127.0.0.1`؛ WaterWall `EncryptionServer` روی `10.10.0.1`.
-4. `PROTO` روی هر دو طرف یکسان باشد (Install یا Edit).
+3. با رمزنگاری: پنل خارج می‌تواند روی `0.0.0.0:PUBLIC` بماند؛ WaterWall فقط `10.10.0.1:INTERNAL` را بایند می‌کند.
+4. `PROTO` و `PORT_OFFSET` روی هر دو طرف یکسان باشد (Install یا Edit).
 5. برای CPU قدیمی، هنگام نصب/Edit گزینه `old-cpu` را انتخاب کن. با رمزنگاری، الگوریتم باید `chacha20-poly1305` باشد (نه `aes-gcm`).
 6. مسیر نصب: `/opt/waterwall-proto51`
 7. بعد از ریبوت، سرویس و watchdog باید خودکار برگردند؛ Status را چک کن.
