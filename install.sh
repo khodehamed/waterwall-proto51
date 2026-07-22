@@ -152,6 +152,32 @@ normalize_ports() {
 # Public panel ports stay untouched on Kharej (panel may keep 0.0.0.0:PUBLIC_PORT).
 PORT_OFFSET_DEFAULT=10000
 PORT_OFFSET="${PORT_OFFSET:-$PORT_OFFSET_DEFAULT}"
+# Default PUBLIC forward ports (install / edit / change-ports prompts).
+DEFAULT_PORTS="443 2053 2083 2087 2096 8443"
+
+detect_public_ip() {
+  # Best-effort public IPv4 for Status + install/edit defaults (override always allowed).
+  local ip="" url
+  for url in \
+    "https://ifconfig.me" \
+    "https://api.ipify.org" \
+    "https://ipv4.icanhazip.com"; do
+    ip="$(curl -4 -fsS --connect-timeout 2 --max-time 3 "$url" 2>/dev/null | tr -d '[:space:]' || true)"
+    if validate_ip "${ip:-}"; then
+      printf '%s' "$ip"
+      return 0
+    fi
+  done
+  # Fallback: source IP used to reach the public Internet
+  ip="$(ip -4 route get 1.1.1.1 2>/dev/null \
+    | awk '{ for (i = 1; i <= NF; i++) if ($i == "src") { print $(i + 1); exit } }' \
+    || true)"
+  if validate_ip "${ip:-}"; then
+    printf '%s' "$ip"
+    return 0
+  fi
+  return 1
+}
 
 validate_ports() {
   local p
@@ -944,7 +970,18 @@ uninstall_all() {
 }
 
 show_status() {
+  local this_ip=""
+  this_ip="$(detect_public_ip || true)"
+
   echo
+  echo -e "${CYN}This server:${NC}"
+  if [[ -n "${this_ip:-}" ]]; then
+    echo -e "  public IP : ${GRN}${this_ip}${NC}  (copy/paste for the other side)"
+  else
+    warn "public IP : could not auto-detect (check outbound HTTPS / interface)"
+  fi
+  echo
+
   if [[ -f "$CONF_ENV" ]]; then
     echo -e "${CYN}Config:${NC}"
     # shellcheck disable=SC1090
@@ -978,6 +1015,27 @@ show_status() {
   echo -e "${CYN}Enabled at boot:${NC}"
   systemctl is-enabled "${SERVICE_NAME}.service" 2>/dev/null || true
   systemctl is-enabled "${SERVICE_NAME}-watchdog.timer" 2>/dev/null || true
+}
+
+show_tunnel_logs() {
+  local n=100
+  echo
+  echo -e "${CYN}Tunnel logs${NC} (journalctl -u ${SERVICE_NAME}, last ${n} lines)"
+  echo "========================================"
+  journalctl -u "${SERVICE_NAME}" -n "$n" --no-pager 2>/dev/null || warn "journalctl unavailable"
+  echo
+  if compgen -G "${INSTALL_DIR}/log/*.log" >/dev/null 2>&1; then
+    echo -e "${CYN}WaterWall log files${NC} (tail last 80 lines each, newest first)"
+    echo "========================================"
+    # shellcheck disable=SC2012
+    ls -1t "${INSTALL_DIR}"/log/*.log 2>/dev/null | head -n 4 | while read -r f; do
+      echo
+      echo "---- ${f} ----"
+      tail -n 80 "$f" 2>/dev/null || true
+    done
+  else
+    msg "No files under ${INSTALL_DIR}/log/ yet"
+  fi
 }
 
 apply_tunnel_config() {
@@ -1062,10 +1120,21 @@ edit_tunnel() {
 
   [[ -n "$side" && -n "$iran_ip" && -n "$kh_ip" ]] || err "tunnel.env incomplete; reinstall"
 
+  local this_ip=""
+  this_ip="$(detect_public_ip || true)"
+
   echo
   echo -e "${CYN}Edit tunnel${NC} (Enter keeps current value)"
   echo "  current side : ${side}"
   echo "  PROTO is saved to tunnel.env and written into IpManipulator.protoswap"
+  if [[ -n "${this_ip:-}" ]]; then
+    echo -e "  this server  : ${GRN}${this_ip}${NC}  (auto-detected; copy if needed)"
+    if [[ "$side" == "ir" ]]; then
+      iran_ip="${iran_ip:-$this_ip}"
+    else
+      kh_ip="${kh_ip:-$this_ip}"
+    fi
+  fi
   echo
 
   read_tty -r -p "Iran public IP [${iran_ip}]: " tmp || true
@@ -1105,9 +1174,9 @@ edit_tunnel() {
   # Ports: always prompted on Iran. On Kharej only when encryption is on
   # (same PUBLIC list; INTERNAL hop uses PUBLIC+PORT_OFFSET).
   if [[ "$side" == "ir" ]]; then
-    read_tty -r -p "Listen / forward ports (PUBLIC) [${ports:-80 443}]: " tmp || true
+    read_tty -r -p "Listen / forward ports (PUBLIC) [${ports:-$DEFAULT_PORTS}]: " tmp || true
     [[ -n "${tmp:-}" ]] && ports="$(normalize_ports "$tmp")"
-    ports="$(normalize_ports "${ports:-}")"
+    ports="$(normalize_ports "${ports:-$DEFAULT_PORTS}")"
     [[ -n "$ports" ]] || err "Ports required"
     validate_ports "$ports" || err "Invalid ports"
   elif [[ "$encrypt" == "1" ]]; then
@@ -1120,10 +1189,10 @@ edit_tunnel() {
       read_tty -r -p "Press Enter to keep, or type new ports: " tmp || true
       [[ -n "${tmp:-}" ]] && ports="$(normalize_ports "$tmp")"
     else
-      read_tty -r -p "Same PUBLIC ports as Iran [80 443]: " tmp || true
-      ports="$(normalize_ports "${tmp:-80 443}")"
+      read_tty -r -p "Same PUBLIC ports as Iran [${DEFAULT_PORTS}]: " tmp || true
+      ports="$(normalize_ports "${tmp:-$DEFAULT_PORTS}")"
     fi
-    ports="$(normalize_ports "${ports:-}")"
+    ports="$(normalize_ports "${ports:-$DEFAULT_PORTS}")"
     [[ -n "$ports" ]] || err "Ports required for Kharej encryption"
     validate_ports "$ports" || err "Invalid ports"
   fi
@@ -1202,14 +1271,18 @@ edit_tunnel() {
 }
 
 prompt_install() {
-  local side iran_ip kh_ip ports proto encrypt key oldcpu offset mtu default_ports
-  default_ports="80 443 2053 2083 2087 2096 8080 8443 8880"
+  local side iran_ip kh_ip ports proto encrypt key oldcpu offset mtu this_ip
+  local iran_default="" kh_default=""
   offset="$PORT_OFFSET_DEFAULT"
+  this_ip="$(detect_public_ip || true)"
 
   echo
   echo -e "${CYN}Select side:${NC}"
   echo "  1) Iran   (listen 0.0.0.0 and forward selected ports to kharej)"
   echo "  2) Kharej (packet tunnel endpoint; panel should listen on ports)"
+  if [[ -n "${this_ip:-}" ]]; then
+    echo -e "  Detected this server public IP: ${GRN}${this_ip}${NC}  (used as default for the matching side)"
+  fi
   read_tty -r -p "Choice [1/2]: " side
   case "$side" in
     1) side="ir" ;;
@@ -1217,9 +1290,28 @@ prompt_install() {
     *) err "Invalid choice" ;;
   esac
 
-  read_tty -r -p "Iran public IP: " iran_ip
+  if [[ -n "${this_ip:-}" ]]; then
+    if [[ "$side" == "ir" ]]; then
+      iran_default="$this_ip"
+    else
+      kh_default="$this_ip"
+    fi
+  fi
+
+  if [[ -n "${iran_default:-}" ]]; then
+    read_tty -r -p "Iran public IP [${iran_default}]: " iran_ip || true
+    iran_ip="${iran_ip:-$iran_default}"
+  else
+    read_tty -r -p "Iran public IP: " iran_ip
+  fi
   validate_ip "$iran_ip" || err "Invalid Iran IP"
-  read_tty -r -p "Kharej public IP: " kh_ip
+
+  if [[ -n "${kh_default:-}" ]]; then
+    read_tty -r -p "Kharej public IP [${kh_default}]: " kh_ip || true
+    kh_ip="${kh_ip:-$kh_default}"
+  else
+    read_tty -r -p "Kharej public IP: " kh_ip
+  fi
   validate_ip "$kh_ip" || err "Invalid Kharej IP"
 
   echo
@@ -1260,8 +1352,8 @@ prompt_install() {
   fi
   if [[ "$side" == "ir" ]]; then
     echo "PUBLIC ports to forward from Iran 0.0.0.0 (space/comma separated)"
-    read_tty -r -p "Ports [${ports:-$default_ports}]: " tmp || true
-    ports="$(normalize_ports "${tmp:-${ports:-$default_ports}}")"
+    read_tty -r -p "Ports [${ports:-$DEFAULT_PORTS}]: " tmp || true
+    ports="$(normalize_ports "${tmp:-${ports:-$DEFAULT_PORTS}}")"
     validate_ports "$ports" || err "Invalid ports"
   elif [[ "$encrypt" == "1" ]]; then
     echo
@@ -1273,10 +1365,10 @@ prompt_install() {
       read_tty -r -p "Press Enter to keep, or type new ports: " tmp || true
       [[ -n "${tmp:-}" ]] && ports="$(normalize_ports "$tmp")"
     else
-      read_tty -r -p "Same PUBLIC ports as Iran [${default_ports}]: " tmp || true
-      ports="$(normalize_ports "${tmp:-$default_ports}")"
+      read_tty -r -p "Same PUBLIC ports as Iran [${DEFAULT_PORTS}]: " tmp || true
+      ports="$(normalize_ports "${tmp:-$DEFAULT_PORTS}")"
     fi
-    ports="$(normalize_ports "${ports:-}")"
+    ports="$(normalize_ports "${ports:-$DEFAULT_PORTS}")"
     validate_ports "$ports" || err "Invalid ports"
   fi
 
@@ -1442,8 +1534,8 @@ change_ports() {
 
   local ports offset
   offset="${PORT_OFFSET:-$PORT_OFFSET_DEFAULT}"
-  read_tty -r -p "New PUBLIC ports (space/comma) [${PORTS}]: " ports
-  ports="$(normalize_ports "${ports:-$PORTS}")"
+  read_tty -r -p "New PUBLIC ports (space/comma) [${PORTS:-$DEFAULT_PORTS}]: " ports
+  ports="$(normalize_ports "${ports:-${PORTS:-$DEFAULT_PORTS}}")"
   validate_ports "$ports" || err "Invalid ports"
   if [[ "${ENCRYPT:-0}" == "1" ]]; then
     validate_ports_with_offset "$ports" "$offset" \
@@ -1458,16 +1550,25 @@ change_ports() {
 }
 
 menu() {
+  local this_ip=""
   while true; do
     clear 2>/dev/null || true
+    this_ip="$(detect_public_ip || true)"
     echo -e "${CYN}WaterWall Proto51 Tunnel${NC}"
     echo "========================="
+    if [[ -n "${this_ip:-}" ]]; then
+      echo -e "This server IP: ${GRN}${this_ip}${NC}  (auto-detected — copy for the other side)"
+    else
+      echo "This server IP: (auto-detect failed)"
+    fi
+    echo
     echo "1) Install / Reinstall"
     echo "2) Status"
     echo "3) Restart"
     echo "4) Edit tunnel (IPs / PROTO / ports / encryption)"
     echo "5) Change ports"
-    echo "6) Uninstall"
+    echo "6) Show tunnel logs"
+    echo "7) Uninstall"
     echo "0) Exit"
     echo
     echo -e "  Docs: ${CYN}https://radkesvat.github.io/WaterWall-Docs/docs/intro${NC}"
@@ -1479,7 +1580,8 @@ menu() {
       3) systemctl restart "$SERVICE_NAME"; show_status ;;
       4) edit_tunnel ;;
       5) change_ports ;;
-      6) uninstall_all ;;
+      6) show_tunnel_logs ;;
+      7) uninstall_all ;;
       0) exit 0 ;;
       *) warn "Invalid option" ;;
     esac
@@ -1497,6 +1599,7 @@ main() {
     edit) edit_tunnel ;;
     uninstall) uninstall_all ;;
     ports) change_ports ;;
+    logs) show_tunnel_logs ;;
     apply) apply_from_env ;;
     *) menu ;;
   esac

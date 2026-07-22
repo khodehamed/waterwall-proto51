@@ -32,14 +32,23 @@ sudo bash install.sh
 | گزینه | کار |
 |------|-----|
 | **1) Install / Reinstall** | نصب کامل / نصب مجدد (شامل انتخاب `PROTO` و رمزنگاری) |
-| **2) Status** | وضعیت سرویس، `wtun0`، watchdog، و مقادیر `tunnel.env` |
+| **2) Status** | IP عمومی این سرور، وضعیت سرویس، `wtun0`، watchdog، و مقادیر `tunnel.env` |
 | **3) Restart** | ری‌استارت سرویس |
 | **4) Edit tunnel** | ویرایش IP ایران/خارج، **شماره پروتکل (PROTO)**، پورت‌ها، رمزنگاری، old-cpu — بدون نصب کامل |
 | **5) Change ports** | تغییر پورت‌ها (ایران؛ یا خارج وقتی رمزنگاری روشن است) |
-| **6) Uninstall** | حذف سرویس، watchdog و فایل‌ها |
+| **6) Show tunnel logs** | آخرین لاگ‌های `journalctl -u waterwall-proto51` و فایل‌های `/opt/waterwall-proto51/log/` |
+| **7) Uninstall** | حذف سرویس، watchdog و فایل‌ها |
 | **0) Exit** | خروج |
 
+بالای منو و در Status، **IP عمومی این سرور** با `curl` (مثل ifconfig.me / api.ipify.org) یا IP اینترفیس اصلی تشخیص داده می‌شود تا بتوانید کپی کنید؛ در Install/Edit هم به‌عنوان پیش‌فرض سمتِ همین سرور پر می‌شود (قابل تغییر).
+
 تنظیمات ذخیره‌شده در `/opt/waterwall-proto51/tunnel.env` هستند. گزینه Edit همان مقادیر را به‌عنوان پیش‌فرض نشان می‌دهد.
+
+CLI لاگ:
+
+```bash
+sudo ww51 logs
+```
 
 ### تغییر شماره پروتکل (PROTO)
 
@@ -132,7 +141,7 @@ library "AesGcm" (hash: ...) could not be loaded
 
 ## پورت‌های پیش‌فرض ایران
 
-`80 443 2053 2083 2087 2096 8080 8443 8880`
+`443 2053 2083 2087 2096 8443`
 
 ```bash
 sudo ww51
