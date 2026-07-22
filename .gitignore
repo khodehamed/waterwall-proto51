@@ -4,3 +4,7 @@ Waterwall
 libs/
 *.zip
 .DS_Store
+_diag_*
+_fix_*
+*.pem
+*.key

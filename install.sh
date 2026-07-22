@@ -93,8 +93,9 @@ download_waterwall() {
   [[ -s "$zip_path" ]] || err "Downloaded zip is empty: $zip_path"
 
   msg "Extracting WaterWall binary..."
-  mkdir -p "$INSTALL_DIR"
-  rm -rf "${INSTALL_DIR}/Waterwall" "${INSTALL_DIR}/libs" 2>/dev/null || true
+  mkdir -p "$INSTALL_DIR" "${INSTALL_DIR}/log" "${INSTALL_DIR}/libs"
+  rm -f "${INSTALL_DIR}/Waterwall" 2>/dev/null || true
+  # Keep any existing libs/; release zips for 1.46.x often ship a single static Waterwall binary.
   if ! unzip -o "$zip_path" -d "$INSTALL_DIR" >/dev/null; then
     err "unzip failed (is unzip installed?)"
   fi
@@ -155,7 +156,29 @@ validate_ports() {
   return 0
 }
 
-build_port_listeners() {
+assert_ports_free() {
+  # Iran TcpListeners need exclusive bind on 0.0.0.0:port.
+  local ports="$1" p busy="" line
+  command -v ss >/dev/null 2>&1 || return 0
+  for p in $ports; do
+    line="$(ss -lntH "sport = :$p" 2>/dev/null | head -n1 || true)"
+    if [[ -n "$line" ]]; then
+      busy+="  port ${p}: ${line}"$'\n'
+    fi
+  done
+  if [[ -n "$busy" ]]; then
+    echo -e "${RED}ERR${NC} These ports are already in use (WaterWall cannot bind):" >&2
+    echo -e "$busy" >&2
+    echo "Free them (stop x-ui/backhaul/nginx/etc. on Iran) or choose different ports." >&2
+    echo "Hint: ss -lntup | grep -E ':PORT'" >&2
+    exit 1
+  fi
+}
+
+build_port_forward_nodes() {
+  # WaterWall 1.46+ auto-inserts TcpConnector.domain-resolver and does NOT allow
+  # multiple listeners to share one connector next. Emit one listener+connector
+  # pair per port instead of fan-in to a shared "to_kharej".
   local ports="$1"
   local p first=1
   for p in $ports; do
@@ -173,7 +196,16 @@ build_port_listeners() {
                 "port": ${p},
                 "nodelay": true
             },
-            "next": "to_kharej"
+            "next": "c${p}"
+        },
+        {
+            "name": "c${p}",
+            "type": "TcpConnector",
+            "settings": {
+                "nodelay": true,
+                "address": "10.10.0.2",
+                "port": ${p}
+            }
         }
 EOF
   done
@@ -214,7 +246,7 @@ write_core_json() {
     "misc": {
         "workers": 1,
         "mtu": ${mtu},
-        "ram-profile": "server",
+        "ram-profile": "client",
         "libs-path": "libs/"
     },
     "configs": [
@@ -226,21 +258,9 @@ EOF
 
 write_iran_config() {
   local iran_ip="$1" kh_ip="$2" proto="$3" encrypt="$4" key="$5" ports="$6"
-  local listeners connector aes_node next_after_tun
+  local forward_nodes aes_node next_after_tun
 
-  listeners="$(build_port_listeners "$ports")"
-  connector="$(cat <<'EOF'
-        {
-            "name": "to_kharej",
-            "type": "TcpConnector",
-            "settings": {
-                "nodelay": true,
-                "address": "10.10.0.2",
-                "port": "src_context->port"
-            }
-        }
-EOF
-)"
+  forward_nodes="$(build_port_forward_nodes "$ports")"
 
   if [[ "$encrypt" == "1" ]]; then
     next_after_tun="aes"
@@ -330,8 +350,7 @@ ${aes_node}
                 "capture-ip": "${kh_ip}"
             }
         },
-${listeners},
-${connector}
+${forward_nodes}
     ]
 }
 EOF
@@ -449,6 +468,8 @@ EOF
 }
 
 write_service() {
+  # WaterWall needs root for TunDevice (/dev/net/tun) + RawSocket.
+  # Do not sandbox with NoNewPrivileges/CapabilityBoundingSet — those break TUN/raw.
   cat > "/etc/systemd/system/${SERVICE_NAME}.service" <<EOF
 [Unit]
 Description=WaterWall Proto51 Tunnel
@@ -457,14 +478,14 @@ Wants=network-online.target
 
 [Service]
 Type=simple
+User=root
 WorkingDirectory=${INSTALL_DIR}
 ExecStart=${INSTALL_DIR}/Waterwall
 Restart=always
 RestartSec=3
 LimitNOFILE=1048576
-AmbientCapabilities=CAP_NET_ADMIN CAP_NET_RAW
-CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_RAW
-NoNewPrivileges=true
+# Root + no privilege sandbox: TunDevice and RawSocket need unrestricted net admin.
+NoNewPrivileges=false
 
 [Install]
 WantedBy=multi-user.target
@@ -492,13 +513,40 @@ EOF
   sysctl --system >/dev/null 2>&1 || true
 }
 
+show_failure_logs() {
+  echo
+  warn "Service is NOT healthy. Recent journal:"
+  journalctl -u "${SERVICE_NAME}" -n 50 --no-pager || true
+  echo
+  if compgen -G "${INSTALL_DIR}/log/*.log" >/dev/null 2>&1; then
+    warn "WaterWall log files:"
+    # shellcheck disable=SC2012
+    ls -1t "${INSTALL_DIR}"/log/*.log 2>/dev/null | head -n 4 | while read -r f; do
+      echo "---- ${f} (tail) ----"
+      tail -n 30 "$f" 2>/dev/null || true
+    done
+  fi
+}
+
 start_service() {
   msg "Enabling and starting ${SERVICE_NAME}.service..."
   systemctl daemon-reload || err "systemctl daemon-reload failed"
-  systemctl enable --now "${SERVICE_NAME}.service" || err "Failed to enable/start ${SERVICE_NAME}.service"
-  sleep 1
+  systemctl enable "${SERVICE_NAME}.service" || err "Failed to enable ${SERVICE_NAME}.service"
+  systemctl restart "${SERVICE_NAME}.service" || true
+  sleep 2
+
+  local state result
+  state="$(systemctl is-active "${SERVICE_NAME}.service" 2>/dev/null || true)"
+  result="$(systemctl show -p Result --value "${SERVICE_NAME}.service" 2>/dev/null || true)"
   systemctl --no-pager --full status "${SERVICE_NAME}.service" || true
-  ok "Service started (or start attempted - check status above)"
+
+  if [[ "$state" == "active" ]]; then
+    ok "Service is active (running)"
+    return 0
+  fi
+
+  show_failure_logs
+  err "Service failed to stay running (state=${state:-unknown} result=${result:-unknown}). See logs above."
 }
 
 stop_service() {
@@ -576,15 +624,22 @@ prompt_install() {
     fi
   fi
 
-  encrypt=1
-  read_tty -r -p "Enable AesGcm encryption? [Y/n]: " tmp || true
-  case "${tmp:-Y}" in
-    n|N|no|NO) encrypt=0 ;;
-    *) encrypt=1 ;;
+  # Default OFF: WaterWall 1.46.x release zips often ship a single binary without
+  # a loadable AesGcm shared library under libs/, which crashes with:
+  #   library "AesGcm" ... could not be loaded
+  encrypt=0
+  echo
+  echo -e "${YLW}Note:${NC} AesGcm encryption is OFF by default (more reliable)."
+  echo "      Official WaterWall binaries frequently lack the AesGcm plugin library."
+  read_tty -r -p "Enable AesGcm encryption anyway? [y/N]: " tmp || true
+  case "${tmp:-N}" in
+    y|Y|yes|YES) encrypt=1 ;;
+    *) encrypt=0 ;;
   esac
 
   key=""
   if [[ "$encrypt" == "1" ]]; then
+    warn "AesGcm may crash if libs/AesGcm is missing from the WaterWall release."
     read_tty -r -p "AES key (32 chars, empty=auto): " key || true
     if [[ -z "${key:-}" ]]; then
       msg "Generating AES key..."
@@ -614,6 +669,8 @@ prompt_install() {
   write_core_json "$side" "$mtu"
 
   if [[ "$side" == "ir" ]]; then
+    msg "Checking Iran listen ports are free..."
+    assert_ports_free "$ports"
     write_iran_config "$iran_ip" "$kh_ip" "$proto" "$encrypt" "$key" "$ports"
   else
     write_kharej_config "$iran_ip" "$kh_ip" "$proto" "$encrypt" "$key"
@@ -677,10 +734,17 @@ change_ports() {
   ports="$(normalize_ports "${ports:-$PORTS}")"
   validate_ports "$ports" || err "Invalid ports"
 
+  assert_ports_free "$ports"
   write_iran_config "$IRAN_IP" "$KHAREJ_IP" "$PROTO" "$ENCRYPT" "$AES_KEY" "$ports"
   write_env "ir" "$IRAN_IP" "$KHAREJ_IP" "$PROTO" "$ENCRYPT" "$AES_KEY" "$ports" "${OLDCPU:-0}"
   systemctl restart "$SERVICE_NAME"
-  ok "Ports updated: $ports"
+  sleep 2
+  if [[ "$(systemctl is-active "$SERVICE_NAME" 2>/dev/null || true)" == "active" ]]; then
+    ok "Ports updated: $ports"
+  else
+    show_failure_logs
+    err "Service failed after port change"
+  fi
 }
 
 menu() {
