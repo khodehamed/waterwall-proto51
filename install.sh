@@ -470,11 +470,13 @@ EOF
 write_service() {
   # WaterWall needs root for TunDevice (/dev/net/tun) + RawSocket.
   # Do not sandbox with NoNewPrivileges/CapabilityBoundingSet — those break TUN/raw.
+  # StartLimitIntervalSec=0: never give up restarting after reboot or crash loops.
   cat > "/etc/systemd/system/${SERVICE_NAME}.service" <<EOF
 [Unit]
 Description=WaterWall Proto51 Tunnel
 After=network-online.target
 Wants=network-online.target
+StartLimitIntervalSec=0
 
 [Service]
 Type=simple
@@ -482,7 +484,7 @@ User=root
 WorkingDirectory=${INSTALL_DIR}
 ExecStart=${INSTALL_DIR}/Waterwall
 Restart=always
-RestartSec=3
+RestartSec=5
 LimitNOFILE=1048576
 # Root + no privilege sandbox: TunDevice and RawSocket need unrestricted net admin.
 NoNewPrivileges=false
@@ -490,6 +492,80 @@ NoNewPrivileges=false
 [Install]
 WantedBy=multi-user.target
 EOF
+}
+
+write_watchdog() {
+  # Lightweight self-contained recovery: timer every 2m checks service + wtun0.
+  mkdir -p "$INSTALL_DIR"
+  cat > "${INSTALL_DIR}/watchdog.sh" <<'EOF'
+#!/usr/bin/env bash
+# waterwall-proto51 watchdog — restart if service inactive or wtun0 missing
+set -euo pipefail
+SERVICE_NAME="waterwall-proto51"
+LOG_TAG="waterwall-proto51-watchdog"
+
+need_restart=0
+state="$(systemctl is-active "${SERVICE_NAME}.service" 2>/dev/null || true)"
+if [[ "$state" != "active" ]]; then
+  need_restart=1
+  logger -t "$LOG_TAG" "service not active (state=${state:-unknown}); restarting"
+fi
+
+if ! ip link show wtun0 >/dev/null 2>&1; then
+  need_restart=1
+  logger -t "$LOG_TAG" "wtun0 missing; restarting ${SERVICE_NAME}"
+fi
+
+if [[ "$need_restart" -eq 1 ]]; then
+  systemctl restart "${SERVICE_NAME}.service" || true
+fi
+exit 0
+EOF
+  chmod 755 "${INSTALL_DIR}/watchdog.sh"
+
+  cat > "/etc/systemd/system/${SERVICE_NAME}-watchdog.service" <<EOF
+[Unit]
+Description=WaterWall Proto51 Watchdog (oneshot check)
+After=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=${INSTALL_DIR}/watchdog.sh
+Nice=10
+EOF
+
+  cat > "/etc/systemd/system/${SERVICE_NAME}-watchdog.timer" <<EOF
+[Unit]
+Description=WaterWall Proto51 Watchdog Timer (every 2 minutes)
+Requires=${SERVICE_NAME}-watchdog.service
+
+[Timer]
+OnBootSec=1min
+OnUnitActiveSec=2min
+AccuracySec=30s
+Persistent=true
+Unit=${SERVICE_NAME}-watchdog.service
+
+[Install]
+WantedBy=timers.target
+EOF
+}
+
+enable_watchdog() {
+  msg "Enabling ${SERVICE_NAME}-watchdog.timer..."
+  write_watchdog
+  systemctl daemon-reload || err "systemctl daemon-reload failed (watchdog)"
+  systemctl enable --now "${SERVICE_NAME}-watchdog.timer" \
+    || err "Failed to enable ${SERVICE_NAME}-watchdog.timer"
+  ok "Watchdog timer enabled (checks every ~2 minutes)"
+}
+
+disable_watchdog() {
+  systemctl disable --now "${SERVICE_NAME}-watchdog.timer" 2>/dev/null || true
+  systemctl stop "${SERVICE_NAME}-watchdog.service" 2>/dev/null || true
+  rm -f "/etc/systemd/system/${SERVICE_NAME}-watchdog.service"
+  rm -f "/etc/systemd/system/${SERVICE_NAME}-watchdog.timer"
+  rm -f "${INSTALL_DIR}/watchdog.sh"
 }
 
 write_menu_wrapper() {
@@ -555,6 +631,7 @@ stop_service() {
 
 uninstall_all() {
   msg "Uninstalling..."
+  disable_watchdog
   stop_service
   rm -f "/etc/systemd/system/${SERVICE_NAME}.service"
   systemctl daemon-reload || true
@@ -574,15 +651,163 @@ show_status() {
     echo "  iran ip   : ${IRAN_IP:-?}"
     echo "  kharej ip : ${KHAREJ_IP:-?}"
     echo "  proto     : ${PROTO:-?}"
-    echo "  encrypt   : ${ENCRYPT:-?}"
+    echo "  encrypt   : ${ENCRYPT:-0}"
     echo "  ports     : ${PORTS:-?}"
+    echo "  old-cpu   : ${OLDCPU:-0}"
   else
     warn "No saved config at $CONF_ENV"
   fi
   echo
+  echo -e "${CYN}Service:${NC}"
   systemctl --no-pager --full status "${SERVICE_NAME}.service" || true
   echo
+  echo -e "${CYN}Watchdog timer:${NC}"
+  systemctl --no-pager --full status "${SERVICE_NAME}-watchdog.timer" 2>/dev/null || warn "watchdog timer not installed"
+  systemctl list-timers "${SERVICE_NAME}-watchdog.timer" --no-pager 2>/dev/null || true
+  echo
+  echo -e "${CYN}Interface:${NC}"
   ip -br addr show wtun0 2>/dev/null || warn "wtun0 not up"
+  echo
+  echo -e "${CYN}Enabled at boot:${NC}"
+  systemctl is-enabled "${SERVICE_NAME}.service" 2>/dev/null || true
+  systemctl is-enabled "${SERVICE_NAME}-watchdog.timer" 2>/dev/null || true
+}
+
+apply_tunnel_config() {
+  # Regenerate JSON from args and restart (no full reinstall).
+  # args: side iran_ip kh_ip proto encrypt key ports oldcpu
+  local side="$1" iran_ip="$2" kh_ip="$3" proto="$4" encrypt="$5" key="$6" ports="$7" oldcpu="$8"
+  local mtu
+
+  if [[ "$side" == "ir" ]]; then mtu=1320; else mtu=1380; fi
+
+  # Stop first so Iran port-free check does not see our own listeners.
+  systemctl stop "${SERVICE_NAME}.service" 2>/dev/null || true
+  sleep 1
+
+  write_core_json "$side" "$mtu"
+  if [[ "$side" == "ir" ]]; then
+    assert_ports_free "$ports"
+    write_iran_config "$iran_ip" "$kh_ip" "$proto" "$encrypt" "$key" "$ports"
+  else
+    write_kharej_config "$iran_ip" "$kh_ip" "$proto" "$encrypt" "$key"
+  fi
+  write_env "$side" "$iran_ip" "$kh_ip" "$proto" "$encrypt" "$key" "$ports" "$oldcpu"
+  write_service
+  systemctl daemon-reload || true
+  systemctl enable "${SERVICE_NAME}.service" || warn "Could not enable ${SERVICE_NAME}.service"
+  systemctl restart "${SERVICE_NAME}.service" || true
+  sleep 2
+  if [[ "$(systemctl is-active "${SERVICE_NAME}.service" 2>/dev/null || true)" == "active" ]]; then
+    ok "Tunnel config applied; service active"
+    return 0
+  fi
+  show_failure_logs
+  err "Service failed after config update"
+}
+
+edit_tunnel() {
+  [[ -f "$CONF_ENV" ]] || err "Not installed (missing $CONF_ENV). Run Install first."
+  # shellcheck disable=SC1090
+  source "$CONF_ENV"
+
+  local side iran_ip kh_ip ports proto encrypt key oldcpu tmp
+  side="${SIDE:-}"
+  iran_ip="${IRAN_IP:-}"
+  kh_ip="${KHAREJ_IP:-}"
+  ports="${PORTS:-}"
+  proto="${PROTO:-51}"
+  encrypt="${ENCRYPT:-0}"
+  key="${AES_KEY:-}"
+  oldcpu="${OLDCPU:-0}"
+
+  [[ -n "$side" && -n "$iran_ip" && -n "$kh_ip" ]] || err "tunnel.env incomplete; reinstall"
+
+  echo
+  echo -e "${CYN}Edit tunnel${NC} (Enter keeps current value)"
+  echo "  current side: ${side}"
+
+  read_tty -r -p "Iran public IP [${iran_ip}]: " tmp || true
+  [[ -n "${tmp:-}" ]] && iran_ip="$tmp"
+  validate_ip "$iran_ip" || err "Invalid Iran IP"
+
+  read_tty -r -p "Kharej public IP [${kh_ip}]: " tmp || true
+  [[ -n "${tmp:-}" ]] && kh_ip="$tmp"
+  validate_ip "$kh_ip" || err "Invalid Kharej IP"
+
+  read_tty -r -p "IP protocol number [${proto}]: " tmp || true
+  [[ -n "${tmp:-}" ]] && proto="$tmp"
+  [[ "$proto" =~ ^[0-9]+$ ]] && ((proto >= 0 && proto <= 255)) || err "Invalid protocol"
+
+  if [[ "$side" == "ir" ]]; then
+    read_tty -r -p "Iran listen ports [${ports}]: " tmp || true
+    [[ -n "${tmp:-}" ]] && ports="$(normalize_ports "$tmp")"
+    ports="$(normalize_ports "$ports")"
+    validate_ports "$ports" || err "Invalid ports"
+  fi
+
+  local enc_prompt="N"
+  [[ "$encrypt" == "1" ]] && enc_prompt="Y"
+  echo
+  echo -e "${YLW}Note:${NC} AesGcm stays OFF unless you explicitly enable it (official binaries often lack the plugin)."
+  read_tty -r -p "Enable AesGcm encryption? [y/N] (current: ${enc_prompt}): " tmp || true
+  case "${tmp:-}" in
+    y|Y|yes|YES) encrypt=1 ;;
+    n|N|no|NO) encrypt=0 ;;
+    "") ;; # keep current
+    *) warn "Keeping current encrypt=${encrypt}" ;;
+  esac
+
+  if [[ "$encrypt" == "1" ]]; then
+    read_tty -r -p "AES key (32 chars) [${key:-empty=auto}]: " tmp || true
+    if [[ -n "${tmp:-}" ]]; then
+      key="$tmp"
+    elif [[ -z "${key:-}" ]]; then
+      msg "Generating AES key..."
+      key="$(gen_key)" || err "AES key auto-generation failed"
+      echo -e "${YLW}Generated AES key (use SAME on other side):${NC} ${GRN}${key}${NC}"
+    fi
+    [[ ${#key} -eq 32 ]] || err "AES key must be exactly 32 characters (got ${#key})"
+  else
+    key=""
+  fi
+
+  local old_prompt="N"
+  [[ "$oldcpu" == "1" ]] && old_prompt="Y"
+  local prev_oldcpu="$oldcpu"
+  read_tty -r -p "Use old-cpu WaterWall binary? [y/N] (current: ${old_prompt}): " tmp || true
+  case "${tmp:-}" in
+    y|Y|yes|YES) oldcpu=1 ;;
+    n|N|no|NO) oldcpu=0 ;;
+    "") ;; # keep
+    *) ;;
+  esac
+
+  msg "Rewriting configs from edited values..."
+  if [[ "$oldcpu" != "$prev_oldcpu" ]] || [[ ! -x "${INSTALL_DIR}/Waterwall" ]]; then
+    ensure_deps
+    download_waterwall "$oldcpu"
+  fi
+
+  # refresh cached installer if possible
+  if [[ -f "${BASH_SOURCE[0]:-}" && -r "${BASH_SOURCE[0]}" ]]; then
+    cp -f "${BASH_SOURCE[0]}" "${INSTALL_DIR}/install.sh" 2>/dev/null || true
+  fi
+
+  apply_tunnel_config "$side" "$iran_ip" "$kh_ip" "$proto" "$encrypt" "$key" "$ports" "$oldcpu"
+  enable_watchdog
+
+  echo
+  ok "Edit applied on side=${side}"
+  echo "  iran ip   : $iran_ip"
+  echo "  kharej ip : $kh_ip"
+  echo "  proto     : $proto"
+  echo "  encrypt   : $encrypt"
+  [[ "$side" == "ir" ]] && echo "  ports     : $ports"
+  if [[ "$encrypt" == "1" ]]; then
+    echo -e "  ${YLW}AES key   : ${key}${NC}"
+  fi
+  echo "  Apply the same IPs/proto/encrypt (and AES key) on the other server if you changed them."
 }
 
 prompt_install() {
@@ -704,22 +929,31 @@ prompt_install() {
   fi
 
   start_service
+  enable_watchdog
 
+  # Verify boot persistence
+  if systemctl is-enabled --quiet "${SERVICE_NAME}.service" 2>/dev/null; then
+    ok "Service enabled at boot (survives reboot)"
+  else
+    warn "Service may not be enabled at boot — run: systemctl enable ${SERVICE_NAME}"
+  fi
 
   echo
   ok "Installed on side=${side}"
-  echo "  dir     : $INSTALL_DIR"
-  echo "  service : systemctl status ${SERVICE_NAME}"
-  echo "  menu    : ww51"
+  echo "  dir      : $INSTALL_DIR"
+  echo "  service  : systemctl status ${SERVICE_NAME}"
+  echo "  watchdog : systemctl status ${SERVICE_NAME}-watchdog.timer"
+  echo "  menu     : ww51"
+  echo "  config   : $CONF_ENV"
   if [[ "$side" == "ir" ]]; then
-    echo "  forward : 0.0.0.0:{${ports// /,}} -> ${kh_ip} via 10.10.0.2"
-    echo "  note    : on Kharej, panel/xray must listen on the same ports (0.0.0.0 or 10.10.0.1)"
+    echo "  forward  : 0.0.0.0:{${ports// /,}} -> ${kh_ip} via 10.10.0.2"
+    echo "  note     : on Kharej, panel/xray must listen on the same ports (0.0.0.0 or 10.10.0.1)"
   else
-    echo "  note    : start Kharej first, then Iran"
+    echo "  note     : start Kharej first, then Iran"
   fi
   if [[ "$encrypt" == "1" ]]; then
-    echo -e "  ${YLW}AES key : ${key}${NC}"
-    echo "           use the SAME key on both servers"
+    echo -e "  ${YLW}AES key  : ${key}${NC}"
+    echo "            use the SAME key on both servers"
   fi
 }
 
@@ -734,17 +968,8 @@ change_ports() {
   ports="$(normalize_ports "${ports:-$PORTS}")"
   validate_ports "$ports" || err "Invalid ports"
 
-  assert_ports_free "$ports"
-  write_iran_config "$IRAN_IP" "$KHAREJ_IP" "$PROTO" "$ENCRYPT" "$AES_KEY" "$ports"
-  write_env "ir" "$IRAN_IP" "$KHAREJ_IP" "$PROTO" "$ENCRYPT" "$AES_KEY" "$ports" "${OLDCPU:-0}"
-  systemctl restart "$SERVICE_NAME"
-  sleep 2
-  if [[ "$(systemctl is-active "$SERVICE_NAME" 2>/dev/null || true)" == "active" ]]; then
-    ok "Ports updated: $ports"
-  else
-    show_failure_logs
-    err "Service failed after port change"
-  fi
+  apply_tunnel_config "ir" "$IRAN_IP" "$KHAREJ_IP" "$PROTO" "${ENCRYPT:-0}" "${AES_KEY:-}" "$ports" "${OLDCPU:-0}"
+  ok "Ports updated: $ports"
 }
 
 menu() {
@@ -755,8 +980,9 @@ menu() {
     echo "1) Install / Reinstall"
     echo "2) Status"
     echo "3) Restart"
-    echo "4) Change Iran ports"
-    echo "5) Uninstall"
+    echo "4) Edit tunnel (IPs / ports / protocol)"
+    echo "5) Change Iran ports"
+    echo "6) Uninstall"
     echo "0) Exit"
     echo
     read_tty -r -p "Select: " c || exit 0
@@ -764,8 +990,9 @@ menu() {
       1) prompt_install ;;
       2) show_status ;;
       3) systemctl restart "$SERVICE_NAME"; show_status ;;
-      4) change_ports ;;
-      5) uninstall_all ;;
+      4) edit_tunnel ;;
+      5) change_ports ;;
+      6) uninstall_all ;;
       0) exit 0 ;;
       *) warn "Invalid option" ;;
     esac
@@ -780,6 +1007,7 @@ main() {
     install) prompt_install ;;
     status) show_status ;;
     restart) systemctl restart "$SERVICE_NAME"; show_status ;;
+    edit) edit_tunnel ;;
     uninstall) uninstall_all ;;
     ports) change_ports ;;
     *) menu ;;
