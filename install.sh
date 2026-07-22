@@ -1111,9 +1111,9 @@ edit_tunnel() {
   kh_ip="${KHAREJ_IP:-}"
   ports="${PORTS:-}"
   proto="${PROTO:-51}"
-  encrypt="${ENCRYPT:-0}"
+  encrypt="${ENCRYPT:-1}"
   key="${AES_KEY:-}"
-  oldcpu="${OLDCPU:-0}"
+  oldcpu="${OLDCPU:-1}"
   offset="${PORT_OFFSET:-$PORT_OFFSET_DEFAULT}"
   PORT_OFFSET="$offset"
   ENC_ALGO="${ENC_ALGO:-$ENC_ALGO_DEFAULT}"
@@ -1162,8 +1162,10 @@ edit_tunnel() {
   echo "  Kharej panel may stay on 0.0.0.0:PUBLIC — installer never moves panel/x-ui."
   echo "  Docs  : https://radkesvat.github.io/WaterWall-Docs/docs/noderefs/EncryptionClient"
   echo "  Algo  : auto-probe (prefer chacha20-poly1305; current saved: ${ENC_ALGO:-$ENC_ALGO_DEFAULT})"
-  echo "  Default OFF for safety. No libs/ plugin required (nodes are built into the binary)."
-  read_tty -r -p "Enable EncryptionClient/Server? [y/N] (current: ${enc_prompt}): " tmp || true
+  echo "  Default ON when unset; Enter keeps the current saved value. No libs/ plugin required."
+  local enc_yn="Y/n"
+  [[ "$encrypt" == "1" ]] || enc_yn="y/N"
+  read_tty -r -p "Enable EncryptionClient/Server? [${enc_yn}] (current: ${enc_prompt}): " tmp || true
   case "${tmp:-}" in
     y|Y|yes|YES) encrypt=1 ;;
     n|N|no|NO) encrypt=0 ;;
@@ -1220,8 +1222,10 @@ edit_tunnel() {
 
   local old_prompt="N"
   [[ "$oldcpu" == "1" ]] && old_prompt="Y"
+  local old_yn="Y/n"
+  [[ "$oldcpu" == "1" ]] || old_yn="y/N"
   local prev_oldcpu="$oldcpu"
-  read_tty -r -p "Use old-cpu WaterWall binary? [y/N] (current: ${old_prompt}): " tmp || true
+  read_tty -r -p "Use old-cpu WaterWall binary? [${old_yn}] (current: ${old_prompt}): " tmp || true
   case "${tmp:-}" in
     y|Y|yes|YES) oldcpu=1 ;;
     n|N|no|NO) oldcpu=0 ;;
@@ -1323,12 +1327,12 @@ prompt_install() {
   [[ -n "${tmp:-}" ]] && proto="$tmp"
   [[ "$proto" =~ ^[0-9]+$ ]] && ((proto >= 0 && proto <= 255)) || err "Invalid protocol (0-255)"
 
-  # Default OFF until user opts in. Encryption uses built-in EncryptionClient/Server
+  # Default ON (Enter = yes). Encryption uses built-in EncryptionClient/Server
   # (docs), not the removed AesGcm dynamic library that crashed with:
   #   library "AesGcm" ... could not be loaded
-  encrypt=0
+  encrypt=1
   echo
-  echo -e "${CYN}Encryption (optional, default OFF)${NC}"
+  echo -e "${CYN}Encryption (default ON)${NC}"
   echo "  Uses official AEAD nodes EncryptionClient + EncryptionServer (built into binary)."
   echo "  Docs: https://radkesvat.github.io/WaterWall-Docs/docs/noderefs/EncryptionClient"
   echo "  Encrypt hop uses INTERNAL ports on TUN: INTERNAL = PUBLIC + PORT_OFFSET (default ${PORT_OFFSET_DEFAULT})."
@@ -1336,10 +1340,10 @@ prompt_install() {
   echo "  Algorithm auto-selected after download (prefer chacha20-poly1305; aes-gcm only if usable)."
   echo "  old-cpu binaries: AES-GCM is unavailable — script uses chacha20-poly1305 or falls back to OFF."
   echo "  No libs/ plugin download is required. AesGcm plugin is NOT used."
-  read_tty -r -p "Enable EncryptionClient/Server? [y/N]: " tmp || true
-  case "${tmp:-N}" in
-    y|Y|yes|YES) encrypt=1 ;;
-    *) encrypt=0 ;;
+  read_tty -r -p "Enable EncryptionClient/Server? [Y/n]: " tmp || true
+  case "${tmp:-Y}" in
+    n|N|no|NO) encrypt=0 ;;
+    *) encrypt=1 ;;
   esac
 
   ports=""
@@ -1394,11 +1398,11 @@ prompt_install() {
     [[ ${#key} -eq 32 ]] || err "Key must be exactly 32 characters (got ${#key})"
   fi
 
-  oldcpu=0
-  read_tty -r -p "Use old-cpu WaterWall binary? [y/N]: " tmp || true
-  case "${tmp:-N}" in
-    y|Y|yes|YES) oldcpu=1 ;;
-    *) oldcpu=0 ;;
+  oldcpu=1
+  read_tty -r -p "Use old-cpu WaterWall binary? [Y/n]: " tmp || true
+  case "${tmp:-Y}" in
+    n|N|no|NO) oldcpu=0 ;;
+    *) oldcpu=1 ;;
   esac
 
   if [[ "$side" == "ir" ]]; then mtu=1320; else mtu=1380; fi

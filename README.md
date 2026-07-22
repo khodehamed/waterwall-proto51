@@ -98,7 +98,7 @@ Kharej: TcpListener(10.10.0.1:INTERNAL) -> EncryptionServer -> TcpConnector(127.
 
 ```bash
 PORT_OFFSET=10000
-PORTS="443 2053 8443 2083"
+PORTS="443 2053 2083 2087 2096 8443"
 ```
 
 #### نکات مهم (UX)
@@ -143,6 +143,13 @@ library "AesGcm" (hash: ...) could not be loaded
 
 `443 2053 2083 2087 2096 8443`
 
+Install prompts (empty Enter):
+- `Enable EncryptionClient/Server? [Y/n]` → **Y** (encryption on)
+- `Use old-cpu WaterWall binary? [Y/n]` → **Y** (old-cpu zip)
+- Ports → the list above
+
+Edit tunnel: Enter keeps the **current** saved value; if unset, encrypt/old-cpu default to **Y**.
+
 ```bash
 sudo ww51
 # 4) Edit tunnel   یا   5) Change ports
@@ -173,7 +180,7 @@ sudo ww51 status
 ### روشن کردن رمزنگاری روی هر دو سرور
 
 1. اول **خارج** (`sudo ww51` → Edit یا Install):
-   - `Enable EncryptionClient/Server?` → `y`
+   - `Enable EncryptionClient/Server? [Y/n]` → Enter or `y` (default **ON**)
    - همان پورت‌های PUBLIC ایران + همان `PORT_OFFSET` (پیش‌فرض `10000`)
    - کلید ۳۲ کاراکتری را بساز/کپی کن
    - **پنل را جابه‌جا نکن** — می‌تواند روی `0.0.0.0` بماند
