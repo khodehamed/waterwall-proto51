@@ -182,23 +182,135 @@ assert_ports_free() {
 # Pattern: TcpListener -> EncryptionClient -> TcpConnector  (Iran)
 #          TcpListener -> EncryptionServer -> TcpConnector  (Kharej)
 # AesGcm is NOT in WaterWall 1.46.x (no tunnel, no libs plugin) — do not use it.
+#
+# Docs default algorithm is chacha20-poly1305. old-cpu WaterWall builds often
+# lack AES-GCM in the active crypto backend and FATAL on:
+#   "AES-GCM selected but it is unavailable in the active crypto backend"
 ENC_SALT_DEFAULT="waterwall-proto51"
-ENC_ALGO_DEFAULT="aes-gcm"
+ENC_ALGO_DEFAULT="chacha20-poly1305"
 ENC_KDF_DEFAULT="12000"
+# Active algorithm written into configs / tunnel.env (set by probe).
+ENC_ALGO="$ENC_ALGO_DEFAULT"
+
+binary_has_string() {
+  local bin="$1" needle="$2"
+  grep -a -F -q -- "$needle" "$bin" 2>/dev/null
+}
+
+cpu_has_aes_ni() {
+  # x86: "aes" in flags; aarch64 sometimes exposes AES via Features.
+  grep -qiE '(^flags|^Features).*[[:space:]]aes([[:space:]]|$)' /proc/cpuinfo 2>/dev/null
+}
+
+probe_encryption_algorithm() {
+  # Echo a usable EncryptionClient/Server algorithm for the installed binary.
+  # Prefer chacha20-poly1305 (docs default; works without AES-NI / old-cpu).
+  # Never select aes-gcm for old-cpu binaries — backend typically cannot provide it.
+  # Returns 0 + prints algo, or 1 if nothing usable.
+  local oldcpu="${1:-0}"
+  local bin="${INSTALL_DIR}/Waterwall"
+  local has_chacha=0 has_aes=0
+
+  [[ -x "$bin" ]] || return 1
+
+  if binary_has_string "$bin" "chacha20-poly1305" \
+    || binary_has_string "$bin" "chacha20poly1305" \
+    || binary_has_string "$bin" "chacha20" \
+    || binary_has_string "$bin" "chacha"; then
+    has_chacha=1
+  fi
+  if binary_has_string "$bin" "aes-gcm" \
+    || binary_has_string "$bin" "aes-256-gcm" \
+    || binary_has_string "$bin" "aes256gcm" \
+    || binary_has_string "$bin" "aes256-gcm"; then
+    has_aes=1
+  fi
+
+  # old-cpu release builds: AES-GCM string may exist but crypto backend rejects it.
+  if [[ "$oldcpu" == "1" ]]; then
+    has_aes=0
+  elif ! cpu_has_aes_ni; then
+    # Soft AES without AES-NI is slow and some backends still refuse AES-GCM.
+    has_aes=0
+  fi
+
+  # Must not print status on stdout — caller captures the algorithm name.
+  echo -e "${CYN}==>${NC} Crypto probe: old-cpu=${oldcpu} chacha=${has_chacha} aes-gcm=${has_aes} aes-ni=$(cpu_has_aes_ni && echo 1 || echo 0)" >&2
+
+  if [[ "$has_chacha" -eq 1 ]]; then
+    printf '%s' "chacha20-poly1305"
+    return 0
+  fi
+  if [[ "$has_aes" -eq 1 ]]; then
+    printf '%s' "aes-gcm"
+    return 0
+  fi
+  return 1
+}
 
 ensure_encryption_support() {
   # EncryptionClient/Server are statically linked in official WaterWall builds.
-  # Refuse early instead of writing a config that will crash at runtime.
-  # AesGcm is NOT shipped (no tunnel + no libs plugin) — we never emit it.
+  # Probe AEAD algorithms and set ENC_ALGO. Return 0 if encryption can proceed,
+  # 1 if caller should disable encryption (no usable AEAD) instead of crashing.
+  # Arg: oldcpu (0|1). AesGcm plugin is never used.
+  local oldcpu="${1:-0}"
   local bin="${INSTALL_DIR}/Waterwall"
+  local algo=""
+
   [[ -x "$bin" ]] || err "Waterwall binary missing at $bin (download first)"
-  if ! grep -a -q 'EncryptionClient' "$bin" 2>/dev/null; then
-    err "This WaterWall binary lacks EncryptionClient. Re-download an official release (v1.46+) or keep encryption OFF."
+  if ! binary_has_string "$bin" "EncryptionClient"; then
+    warn "This WaterWall binary lacks EncryptionClient (need v1.46+)."
+    return 1
   fi
-  if ! grep -a -q 'EncryptionServer' "$bin" 2>/dev/null; then
-    err "This WaterWall binary lacks EncryptionServer. Re-download an official release (v1.46+) or keep encryption OFF."
+  if ! binary_has_string "$bin" "EncryptionServer"; then
+    warn "This WaterWall binary lacks EncryptionServer (need v1.46+)."
+    return 1
   fi
   ok "EncryptionClient/Server present in binary (no libs/ plugin required)"
+
+  if ! algo="$(probe_encryption_algorithm "$oldcpu")"; then
+    warn "No usable AEAD algorithm for this binary/CPU (old-cpu often lacks AES-GCM)."
+    warn "Docs alternatives: chacha20-poly1305 (preferred), aes-gcm / aes-256-gcm."
+    return 1
+  fi
+  ENC_ALGO="$algo"
+  ok "Selected encryption algorithm: ${ENC_ALGO} (salt=${ENC_SALT_DEFAULT})"
+  return 0
+}
+
+resolve_encryption_or_fallback() {
+  # If encrypt=1, probe algorithms. On failure: warn and force encrypt=0.
+  # Sets globals: ENC_ALGO, and echoes "encrypt key" via nameref-style globals
+  # Caller passes encrypt/key by name through globals ENCRYPT_RESOLVED / KEY_RESOLVED
+  # Actually: mutate caller's locals via eval-free pattern — return via globals.
+  # Usage: resolve_encryption_or_fallback "$encrypt" "$key" "$oldcpu"
+  #         then read ENCRYPT_RESOLVED KEY_RESOLVED
+  local want="$1" key="$2" oldcpu="$3"
+  ENCRYPT_RESOLVED="$want"
+  KEY_RESOLVED="$key"
+  ENC_ALGO="${ENC_ALGO:-$ENC_ALGO_DEFAULT}"
+
+  if [[ "$want" != "1" ]]; then
+    ENCRYPT_RESOLVED=0
+    KEY_RESOLVED=""
+    return 0
+  fi
+
+  if ensure_encryption_support "$oldcpu"; then
+    ENCRYPT_RESOLVED=1
+    KEY_RESOLVED="$key"
+    return 0
+  fi
+
+  warn "============================================================"
+  warn "Encryption requested but no AEAD works on this crypto backend."
+  warn "Auto-fallback: installing WITHOUT encryption (service stays up)."
+  warn "Both Iran and Kharej must use the same encrypt setting."
+  warn "============================================================"
+  ENCRYPT_RESOLVED=0
+  KEY_RESOLVED=""
+  ENC_ALGO="$ENC_ALGO_DEFAULT"
+  return 0
 }
 
 build_iran_forward_nodes() {
@@ -230,7 +342,7 @@ build_iran_forward_nodes() {
             "name": "${next_name}",
             "type": "EncryptionClient",
             "settings": {
-                "algorithm": "${ENC_ALGO_DEFAULT}",
+                "algorithm": "${ENC_ALGO}",
                 "password": "${key}",
                 "salt": "${ENC_SALT_DEFAULT}",
                 "kdf-iterations": ${ENC_KDF_DEFAULT}
@@ -301,7 +413,7 @@ build_kharej_decrypt_nodes() {
             "name": "enc${p}",
             "type": "EncryptionServer",
             "settings": {
-                "algorithm": "${ENC_ALGO_DEFAULT}",
+                "algorithm": "${ENC_ALGO}",
                 "password": "${key}",
                 "salt": "${ENC_SALT_DEFAULT}",
                 "kdf-iterations": ${ENC_KDF_DEFAULT}
@@ -539,6 +651,7 @@ EOF
 write_env() {
   # PROTO = IpManipulator protoswap (0-255). ENCRYPT=1 uses EncryptionClient/Server.
   # AES_KEY is the shared Encryption password (32 chars). Not the removed AesGcm node.
+  # ENC_ALGO is the probed AEAD (usually chacha20-poly1305 on old-cpu).
   cat > "$CONF_ENV" <<EOF
 SIDE=$1
 IRAN_IP=$2
@@ -548,7 +661,7 @@ ENCRYPT=$5
 AES_KEY=$6
 PORTS="$7"
 OLDCPU=$8
-ENC_ALGO=${ENC_ALGO_DEFAULT}
+ENC_ALGO=${ENC_ALGO:-$ENC_ALGO_DEFAULT}
 ENC_SALT=${ENC_SALT_DEFAULT}
 EOF
   chmod 600 "$CONF_ENV"
@@ -770,9 +883,15 @@ apply_tunnel_config() {
   if [[ "$side" == "ir" ]]; then mtu=1320; else mtu=1380; fi
 
   if [[ "$encrypt" == "1" ]]; then
-    ensure_encryption_support
-    [[ -n "$ports" ]] || err "Encryption requires PORTS on both sides (same list)"
-    [[ ${#key} -eq 32 ]] || err "AES/Encryption password must be exactly 32 characters"
+    resolve_encryption_or_fallback "$encrypt" "$key" "$oldcpu"
+    encrypt="$ENCRYPT_RESOLVED"
+    key="$KEY_RESOLVED"
+    if [[ "$encrypt" == "1" ]]; then
+      [[ -n "$ports" ]] || err "Encryption requires PORTS on both sides (same list)"
+      [[ ${#key} -eq 32 ]] || err "Encryption password must be exactly 32 characters"
+    fi
+  else
+    ENC_ALGO="${ENC_ALGO:-$ENC_ALGO_DEFAULT}"
   fi
 
   # Stop first so port-free check does not see our own listeners.
@@ -796,7 +915,7 @@ apply_tunnel_config() {
   systemctl restart "${SERVICE_NAME}.service" || true
   sleep 2
   if [[ "$(systemctl is-active "${SERVICE_NAME}.service" 2>/dev/null || true)" == "active" ]]; then
-    ok "Tunnel config applied; service active (PROTO=${proto} ENCRYPT=${encrypt})"
+    ok "Tunnel config applied; service active (PROTO=${proto} ENCRYPT=${encrypt} ALGO=${ENC_ALGO})"
     return 0
   fi
   show_failure_logs
@@ -817,6 +936,7 @@ edit_tunnel() {
   encrypt="${ENCRYPT:-0}"
   key="${AES_KEY:-}"
   oldcpu="${OLDCPU:-0}"
+  ENC_ALGO="${ENC_ALGO:-$ENC_ALGO_DEFAULT}"
 
   [[ -n "$side" && -n "$iran_ip" && -n "$kh_ip" ]] || err "tunnel.env incomplete; reinstall"
 
@@ -847,6 +967,7 @@ edit_tunnel() {
   echo "  Iran  : TcpListener -> EncryptionClient -> TcpConnector"
   echo "  Kharej: TcpListener(10.10.0.1) -> EncryptionServer -> TcpConnector(127.0.0.1)"
   echo "  Docs  : https://radkesvat.github.io/WaterWall-Docs/docs/noderefs/EncryptionClient"
+  echo "  Algo  : auto-probe (prefer chacha20-poly1305; current saved: ${ENC_ALGO:-$ENC_ALGO_DEFAULT})"
   echo "  Default OFF for safety. No libs/ plugin required (nodes are built into the binary)."
   read_tty -r -p "Enable EncryptionClient/Server? [y/N] (current: ${enc_prompt}): " tmp || true
   case "${tmp:-}" in
@@ -915,12 +1036,12 @@ edit_tunnel() {
   echo "  ports     : ${ports:-none}"
   if [[ "$encrypt" == "1" ]]; then
     echo -e "  ${YLW}key       : ${key}${NC}"
-    echo "  algorithm : ${ENC_ALGO_DEFAULT}  salt=${ENC_SALT_DEFAULT}"
+    echo "  algorithm : ${ENC_ALGO:-$ENC_ALGO_DEFAULT}  salt=${ENC_SALT_DEFAULT}"
     if [[ "$side" == "kharej" ]]; then
       echo -e "  ${YLW}Kharej panel must listen on 127.0.0.1 (same ports). WaterWall binds 10.10.0.1.${NC}"
     fi
   fi
-  echo "  Apply the same IPs / PROTO / encrypt / key / ports on the other server if you changed them."
+  echo "  Apply the same IPs / PROTO / encrypt / key / ports / algorithm on the other server if you changed them."
 }
 
 prompt_install() {
@@ -960,6 +1081,8 @@ prompt_install() {
   echo -e "${CYN}Encryption (optional, default OFF)${NC}"
   echo "  Uses official AEAD nodes EncryptionClient + EncryptionServer (built into binary)."
   echo "  Docs: https://radkesvat.github.io/WaterWall-Docs/docs/noderefs/EncryptionClient"
+  echo "  Algorithm auto-selected after download (prefer chacha20-poly1305; aes-gcm only if usable)."
+  echo "  old-cpu binaries: AES-GCM is unavailable — script uses chacha20-poly1305 or falls back to OFF."
   echo "  No libs/ plugin download is required. AesGcm plugin is NOT used."
   read_tty -r -p "Enable EncryptionClient/Server? [y/N]: " tmp || true
   case "${tmp:-N}" in
@@ -1019,7 +1142,11 @@ prompt_install() {
   download_waterwall "$oldcpu"
 
   if [[ "$encrypt" == "1" ]]; then
-    ensure_encryption_support
+    resolve_encryption_or_fallback "$encrypt" "$key" "$oldcpu"
+    encrypt="$ENCRYPT_RESOLVED"
+    key="$KEY_RESOLVED"
+  else
+    ENC_ALGO="$ENC_ALGO_DEFAULT"
   fi
 
   msg "Writing core.json and tunnel config..."
@@ -1099,8 +1226,11 @@ prompt_install() {
   fi
   if [[ "$encrypt" == "1" ]]; then
     echo -e "  ${YLW}key      : ${key}${NC}"
-    echo "            use the SAME key + PROTO + ports on both servers"
-    echo "  algo     : ${ENC_ALGO_DEFAULT}  salt=${ENC_SALT_DEFAULT}"
+    echo "            use the SAME key + PROTO + ports + algorithm on both servers"
+    echo "  algo     : ${ENC_ALGO:-$ENC_ALGO_DEFAULT}  salt=${ENC_SALT_DEFAULT}"
+    echo "            old-cpu binaries use chacha20-poly1305 (AES-GCM unavailable)"
+  else
+    echo "  encrypt  : off"
   fi
 }
 
