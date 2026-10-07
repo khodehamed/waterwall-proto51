@@ -1046,9 +1046,8 @@ apply_tunnel_config() {
   local mtu
 
   PORT_OFFSET="$offset"
-  # Both ends must use the same MTU. A higher MTU on Kharej makes it
-  # send TCP segments that Iran's tun drops, so handshakes stall.
-  mtu=1320
+  # Both ends use the same MTU.
+  mtu=1380
 
   if [[ "$encrypt" == "1" ]]; then
     resolve_encryption_or_fallback "$encrypt" "$key" "$oldcpu"
@@ -1115,7 +1114,7 @@ edit_tunnel() {
   proto="${PROTO:-51}"
   encrypt="${ENCRYPT:-1}"
   key="${AES_KEY:-}"
-  oldcpu="${OLDCPU:-1}"
+  oldcpu="${OLDCPU:-0}"
   offset="${PORT_OFFSET:-$PORT_OFFSET_DEFAULT}"
   PORT_OFFSET="$offset"
   ENC_ALGO="${ENC_ALGO:-$ENC_ALGO_DEFAULT}"
@@ -1400,16 +1399,15 @@ prompt_install() {
     [[ ${#key} -eq 32 ]] || err "Key must be exactly 32 characters (got ${#key})"
   fi
 
-  oldcpu=1
-  read_tty -r -p "Use old-cpu WaterWall binary? [Y/n]: " tmp || true
-  case "${tmp:-Y}" in
-    n|N|no|NO) oldcpu=0 ;;
-    *) oldcpu=1 ;;
+  oldcpu=0
+  read_tty -r -p "Use old-cpu WaterWall binary? [y/N]: " tmp || true
+  case "${tmp:-N}" in
+    y|Y|yes|YES) oldcpu=1 ;;
+    *) oldcpu=0 ;;
   esac
 
-  # Both ends must use the same MTU. A higher MTU on Kharej makes it
-  # send TCP segments that Iran's tun drops, so handshakes stall.
-  mtu=1320
+  # Both ends use the same MTU.
+  mtu=1380
 
   msg "Starting install for side=${side}..."
   ensure_deps
